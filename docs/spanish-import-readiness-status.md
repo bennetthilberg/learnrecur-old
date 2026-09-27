@@ -534,10 +534,12 @@ The source-read timeout, cooperative and noncooperative abort, claimed-job
 exception, delayed retry timestamp, concurrent worker, stale recovery, and
 published-sibling paths pass local integration tests with fake providers. The
 full database suite passed 579 tests across 46 files on a temporary local
-Postgres 18 database. Lint, Prisma validation/generation, the Next.js build,
-and the AWS worker package build passed. The full
-unit suite has two failures already present on the starting branch: a math
-equivalence edge case and a Metro override assertion. A production deployment,
+Postgres 18 database. After reinstalling the exact lockfile dependencies, all
+1,353 unit tests passed across 151 files. Lint, Prisma validation/generation,
+the Next.js build, and the AWS worker package build passed. The earlier local
+unit failures came from stale `node_modules` versions, not the checked-in
+lockfile. PR #169 is open from `a/activation-timeout-latency` for review.
+A production worker deployment,
 small distinct staging canary, queue-lag observation, and provider-backed
 exercise audit remain unverified. Automatic retries still depend on the
 30-to-120-second item backoff and the five-minute maintenance cadence when no

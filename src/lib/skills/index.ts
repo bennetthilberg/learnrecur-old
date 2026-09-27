@@ -58,6 +58,7 @@ import {
   type LocalizedMaterialEvidenceLoader,
   type LocalizedMaterialSourceRef,
 } from "@/lib/materials/evidence";
+import { BoundedActivationReadError, withBoundedActivationRead } from "@/lib/prisma-bounded-read";
 import {
   buildMetaMuseDataUrl,
   MAX_META_MUSE_INLINE_FILE_BYTES,
@@ -2884,6 +2885,7 @@ async function runActivationStage<T>(input: {
       ) cause = "delivery-soft-deadline";
       else cause = "stage-timeout";
     } else if (error instanceof MaterialEvidencePendingError) cause = "source-ocr-in-progress";
+    else if (error instanceof BoundedActivationReadError) cause = "database-read-failure";
     console.warn(JSON.stringify({
       ...fields,
       outcome: "failed",
@@ -3158,7 +3160,9 @@ export async function activateSkillDraft(
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
     const message = buildSourceMediaLoadFailureMessage(error);
-    const retryable = isJobStageTimeoutError(error) || error instanceof MaterialEvidencePendingError;
+    const retryable = isJobStageTimeoutError(error) ||
+      error instanceof MaterialEvidencePendingError ||
+      error instanceof BoundedActivationReadError;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
       acceptedCount: 0,
@@ -3193,11 +3197,12 @@ export async function activateSkillDraft(
       deadlineAt: input.deadlineAt,
       parentSignal: input.signal,
       maxTimeoutMs: ACTIVATION_RECENT_HISTORY_TIMEOUT_MS,
-      run: () => loadGenerationRecentEvidence({
+      run: () => withBoundedActivationRead((tx) => loadGenerationRecentEvidence({
         userId: input.userId,
         skillId: skill.id,
         now: input.now,
-      }),
+        prisma: tx,
+      })),
     });
   } catch (error) {
     const message = `Recent generation history could not be loaded: ${formatEnvError(error)}`;
@@ -3217,7 +3222,7 @@ export async function activateSkillDraft(
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
-      retryable: isJobStageTimeoutError(error),
+      retryable: true,
     };
   }
 

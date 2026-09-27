@@ -535,11 +535,14 @@ now passes its worker deadline into the same activation stages. A PDF OCR
 claim is released when its stage aborts, even if the underlying generator
 ignores cancellation; a claim still held by another worker is reported as
 retryable pending evidence instead of a permanent missing-source error.
+Recent-history and material-evidence reads now use short PostgreSQL statement
+deadlines inside read transactions, so a noncooperative database query cannot
+hold both worker pool connections after the JavaScript stage deadline fires.
 
 The source-read timeout, cooperative and noncooperative abort, claimed-job
 exception, delayed retry timestamp, concurrent worker, stale recovery, and
 published-sibling paths pass local integration tests with fake providers. The
-full database suite passed 582 tests across 46 files on a temporary local
+full database suite passed 584 tests across 47 files on a temporary local
 Postgres 18 database. After reinstalling the exact lockfile dependencies, all
 1,353 unit tests passed across 151 files. Lint, Prisma validation/generation,
 the Next.js build, and the AWS worker package build passed. The earlier local

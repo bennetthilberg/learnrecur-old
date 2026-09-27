@@ -35,6 +35,7 @@ import {
 } from "@/lib/meta-muse";
 import { resolveOptionalMetaMuseFallbackConfig } from "@/lib/meta-muse-fallback";
 import { getPrisma } from "@/lib/prisma";
+import { withBoundedActivationRead } from "@/lib/prisma-bounded-read";
 import {
   resolveS3SourceObjectStorage,
   type SourceObjectStorage,
@@ -673,7 +674,6 @@ export async function loadLocalizedMaterialEvidence(input: {
     }
   }
 
-  const prisma = getPrisma();
   const chunkConditions = materialRefs.flatMap((sourceRef) => {
     const chunkIds = sourceRef.locator.evidenceChunkIds.filter(
       (evidenceId) => !parseMaterialPageEvidenceId(evidenceId),
@@ -682,22 +682,6 @@ export async function loadLocalizedMaterialEvidence(input: {
       ? [{ materialRevisionId: sourceRef.locator.materialRevisionId, id: { in: chunkIds } }]
       : [];
   });
-  const chunks = chunkConditions.length
-    ? await prisma.materialChunk.findMany({
-        where: { userId: input.userId, OR: chunkConditions },
-        select: {
-          id: true,
-          materialRevisionId: true,
-          ordinal: true,
-          headingText: true,
-          text: true,
-        },
-      })
-    : [];
-  const chunkKeys = new Set(
-    chunks.map((chunk) => `${chunk.materialRevisionId}\u0000${chunk.id}`),
-  );
-
   const pageConditions = materialRefs.flatMap((sourceRef) =>
     sourceRef.locator.source.kind === "pdf"
       ? sourceRef.locator.source.pageRanges.map((range) => ({
@@ -706,18 +690,40 @@ export async function loadLocalizedMaterialEvidence(input: {
         }))
       : [],
   );
-  const pages = pageConditions.length
-    ? await prisma.materialPage.findMany({
-        where: { userId: input.userId, OR: pageConditions },
-        select: {
-          id: true,
-          materialRevisionId: true,
-          pageNumber: true,
-          ocrText: true,
-          textStatus: true,
-        },
-      })
-    : [];
+  throwIfAborted(input.signal);
+  const { chunks, pages } = await withBoundedActivationRead(async (tx) => {
+    const [chunks, pages] = await Promise.all([
+      chunkConditions.length
+        ? tx.materialChunk.findMany({
+            where: { userId: input.userId, OR: chunkConditions },
+            select: {
+              id: true,
+              materialRevisionId: true,
+              ordinal: true,
+              headingText: true,
+              text: true,
+            },
+          })
+        : [],
+      pageConditions.length
+        ? tx.materialPage.findMany({
+            where: { userId: input.userId, OR: pageConditions },
+            select: {
+              id: true,
+              materialRevisionId: true,
+              pageNumber: true,
+              ocrText: true,
+              textStatus: true,
+            },
+          })
+        : [],
+    ]);
+    return { chunks, pages };
+  });
+  throwIfAborted(input.signal);
+  const chunkKeys = new Set(
+    chunks.map((chunk) => `${chunk.materialRevisionId}\u0000${chunk.id}`),
+  );
   const pageKeys = new Set(
     pages.flatMap((page) =>
       page.textStatus === MaterialPageTextStatus.OCR_READY && page.ocrText

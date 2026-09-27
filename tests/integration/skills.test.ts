@@ -1463,6 +1463,7 @@ describeDatabase("skill drafts and Gemini activation", () => {
 
   it("lets only the newest worker finish after reclaiming a stale activation", async () => {
     const userId = await createUser("activate_stale_worker_fence");
+    const firstNow = new Date();
     const draft = await createSkillDraft({
       userId,
       input: {
@@ -1486,7 +1487,7 @@ describeDatabase("skill drafts and Gemini activation", () => {
     const firstActivation = activateSkillDraft({
       userId,
       skillId: draft.skill.id,
-      now,
+      now: firstNow,
       generateChoiceExercises: async () => {
         signalFirstStarted?.();
         await firstCanFinish;
@@ -1509,10 +1510,12 @@ describeDatabase("skill drafts and Gemini activation", () => {
     const secondCanFinish = new Promise<void>((resolve) => {
       releaseSecond = resolve;
     });
+    const secondNow = new Date(firstNow.getTime() + ACTIVATION_GENERATION_STALE_AFTER_MS + 1_000);
     const secondActivation = activateSkillDraft({
       userId,
       skillId: draft.skill.id,
-      now: new Date(now.getTime() + ACTIVATION_GENERATION_STALE_AFTER_MS + 1_000),
+      now: secondNow,
+      eventNow: () => secondNow,
       generateChoiceExercises: async () => {
         signalSecondStarted?.();
         await secondCanFinish;
@@ -1728,7 +1731,7 @@ describeDatabase("skill drafts and Gemini activation", () => {
       status: GenerationJobStatus.FAILED,
       model: "stale-test-gemini",
       errorMessage: ACTIVATION_STALE_JOB_MESSAGE,
-      completedAt: now,
+      completedAt: expect.any(Date),
     });
     expect(
       generationJobs.find(
@@ -1742,8 +1745,8 @@ describeDatabase("skill drafts and Gemini activation", () => {
       acceptedCount: 3,
       rejectedCount: 0,
       errorMessage: null,
-      startedAt: now,
-      completedAt: now,
+      startedAt: expect.any(Date),
+      completedAt: expect.any(Date),
     });
   });
 

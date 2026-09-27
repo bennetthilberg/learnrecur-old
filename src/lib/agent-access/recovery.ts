@@ -158,6 +158,16 @@ export async function recoverStaleAgentOperationItems(input: {
 
   for (const candidate of candidates) {
     const result = await recoverCandidate({ candidate, now: input.now });
+    console.info(JSON.stringify({
+      component: "agent-activation-recovery",
+      operationId: candidate.operationId,
+      operationItemId: candidate.id,
+      skillId: candidate.createdSkillId,
+      stage: candidate.status,
+      decision: result,
+      ageMs: input.now.getTime() - candidate.updatedAt.getTime(),
+      retryCount: candidate.retryCount,
+    }));
     if (result === "requeued") {
       counts.requeued += 1;
     }
@@ -267,9 +277,21 @@ export async function recoverStaleAgentOperationItems(input: {
           stage: "agent recovery continuation publish",
         });
         counts.continuations += 1;
+        console.info(JSON.stringify({
+          component: "agent-activation-recovery",
+          operationId: owner.operationId,
+          decision: "continuation-published",
+          queuedItemCount: eligible.length,
+        }));
       } catch (error) {
         if (!isJobStageTimeoutError(error) && !isContinuationPublishFailure(error)) throw error;
         counts.continuationPublishFailures += 1;
+        console.warn(JSON.stringify({
+          component: "agent-activation-recovery",
+          operationId: owner.operationId,
+          decision: "continuation-publish-failed",
+          cause: isJobStageTimeoutError(error) ? "stage-timeout" : "publish-error",
+        }));
       }
     }
   }

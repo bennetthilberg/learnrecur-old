@@ -4168,7 +4168,7 @@ describeDatabase("material multi-skill drafting", () => {
 
     await prisma.generationJob.updateMany({
       where: { userId, skillId: skill.id, kind: GenerationJobKind.SKILL_ACTIVATION },
-      data: { startedAt: new Date(now.getTime() - 10 * 60 * 1_000) },
+      data: { startedAt: new Date(now.getTime() - 12 * 60 * 1_000) },
     });
     await expect(
       excludeMaterialDraftItem({
@@ -5388,6 +5388,7 @@ describeDatabase("material multi-skill drafting", () => {
   });
 
   it("keeps a batch draft recoverable when a standalone activation supersedes its worker", async () => {
+    const batchNow = new Date();
     const ready = await createReadyBatch([
       {
         key: "cross-flow-activation-fence",
@@ -5401,7 +5402,7 @@ describeDatabase("material multi-skill drafting", () => {
     await queueMaterialBatchActivation({
       userId,
       input: { batchId: ready.id, itemIds: [ready.items[0].id] },
-      now: new Date("2026-07-18T12:00:00.000Z"),
+      now: batchNow,
       eventSender: {
         async sendMaterialBatchActivationRequested(payload) {
           events.push(payload);
@@ -5425,7 +5426,7 @@ describeDatabase("material multi-skill drafting", () => {
       batchId: ready.id,
       itemId: events[0].itemId,
       generationJobId: events[0].generationJobId,
-      now: new Date("2026-07-18T12:01:00.000Z"),
+      now: new Date(batchNow.getTime() + 60_000),
       generateChoiceExercises: async () => {
         signalBatchWorkerStarted?.();
         await batchWorkerCanFail;
@@ -5445,14 +5446,12 @@ describeDatabase("material multi-skill drafting", () => {
     const standaloneCanFinish = new Promise<void>((resolve) => {
       releaseStandalone = resolve;
     });
+    const standaloneNow = new Date(batchNow.getTime() + 60_000 + ACTIVATION_GENERATION_STALE_AFTER_MS + 1_000);
     const standalone = activateSkillDraft({
       userId,
       skillId: ready.items[0].skill.id,
-      now: new Date(
-        new Date("2026-07-18T12:01:00.000Z").getTime() +
-          ACTIVATION_GENERATION_STALE_AFTER_MS +
-          1_000,
-      ),
+      now: standaloneNow,
+      eventNow: () => standaloneNow,
       generateChoiceExercises: async () => {
         signalStandaloneStarted?.();
         await standaloneCanFinish;

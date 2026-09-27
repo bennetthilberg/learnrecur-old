@@ -103,6 +103,7 @@ export type LocalizedMaterialEvidence = {
 export type LocalizedMaterialEvidenceLoader = (input: {
   userId: string;
   sourceRefs: LocalizedMaterialSourceRef[];
+  signal?: AbortSignal;
 }) => Promise<LocalizedMaterialEvidence>;
 
 type EvidenceChunk = {
@@ -612,6 +613,7 @@ export async function loadLocalizedMaterialEvidence(input: {
   userId: string;
   sourceRefs: LocalizedMaterialSourceRef[];
   storage?: SourceObjectStorage;
+  signal?: AbortSignal;
 }): Promise<LocalizedMaterialEvidence> {
   const materialRefs = input.sourceRefs.flatMap((sourceRef) => {
     if (!sourceRef.sourceFile.materialRevisionId) {
@@ -638,6 +640,7 @@ export async function loadLocalizedMaterialEvidence(input: {
         sourceFile: sourceRef.sourceFile,
         pageRanges: sourceRef.locator.source.pageRanges,
         storage: input.storage,
+        signal: input.signal,
       });
     }
   }
@@ -720,6 +723,7 @@ export async function loadLocalizedMaterialEvidence(input: {
   const sourceMedia = await loadLocalizedPdfMedia({
     materialRefs,
     storage: input.storage,
+    signal: input.signal,
   });
 
   return {
@@ -732,6 +736,7 @@ export async function loadLocalizedMaterialEvidence(input: {
 async function loadLocalizedPdfMedia(input: {
   materialRefs: Array<LocalizedMaterialSourceRef & { locator: SkillSourceLocator }>;
   storage?: SourceObjectStorage;
+  signal?: AbortSignal;
 }): Promise<LocalizedMaterialMedia[]> {
   const refs = uniqueBy(
     input.materialRefs.filter(
@@ -763,6 +768,7 @@ async function loadLocalizedPdfMedia(input: {
       key: sourceRef.sourceFile.storageKey,
       bucket: sourceRef.sourceFile.storageBucket,
       maxBytes: MAX_MATERIAL_SOURCE_BYTES,
+      abortSignal: input.signal,
     });
     if (sourceRef.locator.source.kind !== "pdf") {
       continue;

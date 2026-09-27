@@ -14,6 +14,8 @@ vi.mock("@/lib/skills/activation-timing", async (importOriginal) => {
     ...actual,
     GENERATION_TIMEOUT_MS: 1_000,
     ACTIVATION_PROVIDER_CHAIN_TIMEOUT_MS: 2_500,
+    ACTIVATION_SOURCE_EVIDENCE_TIMEOUT_MS: 250,
+    ACTIVATION_RECENT_HISTORY_TIMEOUT_MS: 2_500,
     CHOICE_VERIFICATION_TIMEOUT_MS: 2_500,
     ACTIVATION_GENERATION_COMPLETION_SLACK_MS: 500,
     ACTIVATION_PUBLISH_TRANSACTION_MAX_WAIT_MS: 5_000,
@@ -882,6 +884,157 @@ describeDatabase("agent access persistence", () => {
     expect(Date.now() - startedAt).toBeLessThan(180_000);
   }, 180_000);
 
+  it.each(["noncooperative", "cooperative"] as const)(
+    "bounds a %s source read, then records truthful retry completion times",
+    async (abortBehavior) => {
+      const fixture = await createConnection(`source-read-deadline-${abortBehavior}`);
+      const stalled = await createQueuedDraftOperation(fixture, `stalled-source-read-${abortBehavior}`);
+      const source = await prisma.sourceFile.create({
+        data: {
+          userId: fixture.userId,
+          kind: SourceFileKind.IMAGE,
+          status: SourceFileStatus.READY,
+          originalName: "source-read-test.png",
+          mimeType: "image/png",
+          byteSize: 4,
+          storageBucket: "staging-private",
+          storageKey: `agent-test/${runId}/source-read-test.png`,
+        },
+      });
+      await prisma.skillSourceRef.create({
+        data: { userId: fixture.userId, skillId: stalled.skill.id, sourceFileId: source.id },
+      });
+
+      let sourceAborted = false;
+      const started = Date.now();
+      await expect(runAgentSkillOperationJob({
+        userId: fixture.userId,
+        operationId: stalled.operation.id,
+        deadlineAt: new Date(Date.now() + 120_000),
+      }, {
+        activationOptions: {
+          ...quickActivationOptions(),
+          sourceMediaLoader: ({ signal }) => new Promise((_, reject) => {
+            signal?.addEventListener("abort", () => {
+              sourceAborted = true;
+              if (abortBehavior === "cooperative") reject(signal.reason);
+            }, { once: true });
+          }),
+        },
+      })).resolves.toMatchObject({ status: "processed" });
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(sourceAborted).toBe(true);
+      const firstJob = await prisma.generationJob.findFirstOrThrow({
+        where: { skillId: stalled.skill.id },
+      });
+      expect(firstJob).toMatchObject({
+        status: GenerationJobStatus.FAILED,
+        failureCategory: GenerationFailureCategory.TIMEOUT,
+      });
+      expect(firstJob.errorMessage).toContain("source-evidence timed out");
+      await expect(prisma.agentSkillOperationItem.findUniqueOrThrow({ where: { id: stalled.item.id } }))
+        .resolves.toMatchObject({
+          status: AgentOperationItemStatus.QUEUED,
+          errorCode: "TRANSIENT_WORKER_FAILURE",
+          retryCount: 1,
+          createdSkillId: stalled.skill.id,
+        });
+      await expect(prisma.exercise.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(0);
+
+      await prisma.agentSkillOperationItem.update({
+        where: { id: stalled.item.id },
+        data: { updatedAt: new Date(Date.now() - 31_000) },
+      });
+      await expect(runAgentSkillOperationJob({
+        userId: fixture.userId,
+        operationId: stalled.operation.id,
+        deadlineAt: new Date(Date.now() + 120_000),
+      }, {
+        activationOptions: {
+          ...quickActivationOptions(),
+          sourceMediaLoader: async () => [],
+        },
+      })).resolves.toMatchObject({ status: "processed" });
+
+      const jobs = await prisma.generationJob.findMany({
+        where: { skillId: stalled.skill.id },
+        orderBy: { createdAt: "asc" },
+      });
+      expect(jobs).toHaveLength(2);
+      expect(jobs[1].status).toBe(GenerationJobStatus.SUCCEEDED);
+      expect(jobs[1].completedAt!.getTime()).toBeGreaterThanOrEqual(jobs[1].createdAt.getTime());
+      const completedOperation = await prisma.agentSkillOperation.findUniqueOrThrow({
+        where: { id: stalled.operation.id },
+      });
+      expect(completedOperation.status).toBe(AgentOperationStatus.SUCCEEDED);
+      expect(completedOperation.completedAt!.getTime()).toBeGreaterThanOrEqual(jobs[1].createdAt.getTime());
+      await expect(prisma.exercise.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(3);
+      await expect(prisma.skill.findUniqueOrThrow({ where: { id: stalled.skill.id } }))
+        .resolves.toMatchObject({ status: SkillStatus.ACTIVE, firstIntroducedAt: null });
+      await expect(prisma.exerciseAttempt.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(0);
+    }, 30_000);
+
+  it("fences a claimed generation job when activation throws before recording failure", async () => {
+    const fixture = await createConnection("claimed-job-exception");
+    const stalled = await createQueuedDraftOperation(fixture, "claimed-job-exception");
+    let claimedJobId: string | undefined;
+
+    await expect(runAgentSkillOperationJob({
+      userId: fixture.userId,
+      operationId: stalled.operation.id,
+      deadlineAt: new Date(Date.now() + 120_000),
+    }, {
+      activateDraft: async (input) => {
+        const job = await prisma.generationJob.create({
+          data: {
+            userId: input.userId,
+            skillId: input.skillId,
+            kind: GenerationJobKind.SKILL_ACTIVATION,
+            status: GenerationJobStatus.RUNNING,
+            stage: GenerationJobStage.GENERATING,
+            checkpoint: "claimed",
+            provider: "test",
+            model: "test",
+            promptVersion: "test",
+            requestedCount: 3,
+          },
+        });
+        claimedJobId = job.id;
+        input.onGenerationJobClaimed?.(job.id);
+        throw new Error("injected failure after generation job claim");
+      },
+    })).rejects.toMatchObject({ retryable: true });
+
+    const failedJob = await prisma.generationJob.findUniqueOrThrow({ where: { id: claimedJobId } });
+    expect(failedJob).toMatchObject({
+      status: GenerationJobStatus.FAILED,
+      stage: GenerationJobStage.FAILED,
+      checkpoint: "worker-exception",
+    });
+    expect(failedJob.completedAt!.getTime()).toBeGreaterThanOrEqual(failedJob.createdAt.getTime());
+    await expect(prisma.agentSkillOperationItem.findUniqueOrThrow({ where: { id: stalled.item.id } }))
+      .resolves.toMatchObject({
+        status: AgentOperationItemStatus.QUEUED,
+        errorCode: "TRANSIENT_WORKER_FAILURE",
+        retryCount: 1,
+        createdSkillId: stalled.skill.id,
+      });
+
+    await prisma.agentSkillOperationItem.update({
+      where: { id: stalled.item.id },
+      data: { updatedAt: new Date(Date.now() - 31_000) },
+    });
+    await expect(runAgentSkillOperationJob({
+      userId: fixture.userId,
+      operationId: stalled.operation.id,
+      deadlineAt: new Date(Date.now() + 120_000),
+    }, { activationOptions: quickActivationOptions() })).resolves.toMatchObject({ status: "processed" });
+    await expect(prisma.generationJob.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(2);
+    await expect(prisma.exercise.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(3);
+    await expect(prisma.skill.findUniqueOrThrow({ where: { id: stalled.skill.id } }))
+      .resolves.toMatchObject({ status: SkillStatus.ACTIVE, firstIntroducedAt: null });
+  }, 30_000);
+
   it("recovers a candidate activation whose publication transaction times out", async () => {
     const fixture = await createConnection("publishing-deadline");
     const stalled = await createQueuedDraftOperation(fixture, "candidate-publishing");
@@ -1177,7 +1330,7 @@ describeDatabase("agent access persistence", () => {
       include: { items: true },
     });
 
-    const recoveryNow = new Date("2026-08-13T11:10:00.000Z");
+    const recoveryNow = new Date("2026-08-13T11:12:00.000Z");
     await expect(
       recoverStaleAgentOperationItems({
         userId: fixture.userId,
@@ -1461,7 +1614,7 @@ describeDatabase("agent access persistence", () => {
 
   it("keeps concurrent deliveries waiting on one running activation without duplicating records", async () => {
     const fixture = await createConnection("concurrent-worker-wait");
-    const now = new Date("2026-08-13T13:00:00.000Z");
+    const now = new Date();
     const skill = await prisma.skill.create({
       data: {
         userId: fixture.userId,
@@ -1589,7 +1742,7 @@ describeDatabase("agent access persistence", () => {
   it("recovers stale legacy ACTIVATION_IN_PROGRESS failures and reconciles reservations", async () => {
     const fixture = await createConnection("legacy-activation-wait");
     const now = new Date("2026-08-13T14:00:00.000Z");
-    const staleAt = new Date(now.getTime() - 10 * 60_000);
+    const staleAt = new Date(now.getTime() - 12 * 60_000);
     const skill = await prisma.skill.create({
       data: {
         userId: fixture.userId,

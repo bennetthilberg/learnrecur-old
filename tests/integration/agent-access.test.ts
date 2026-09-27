@@ -74,6 +74,7 @@ import { reserveAgentActivation, runAgentSkillOperationJob } from "@/lib/agent-a
 import * as materialBatches from "@/lib/materials/batches";
 import { createMaterialWithInitialRevision } from "@/lib/materials/lifecycle";
 import { materialScopeResolutionSchema } from "@/lib/materials/contracts";
+import { MaterialEvidencePendingError } from "@/lib/materials/evidence";
 import {
   sendAgentConnectionRevocationRequested,
   sendAgentSkillOperationRequested,
@@ -939,6 +940,8 @@ describeDatabase("agent access persistence", () => {
           retryCount: 1,
           createdSkillId: stalled.skill.id,
         });
+      const retryItem = await prisma.agentSkillOperationItem.findUniqueOrThrow({ where: { id: stalled.item.id } });
+      expect(retryItem.updatedAt.getTime()).toBeGreaterThanOrEqual(started + 200);
       await expect(prisma.exercise.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(0);
 
       await prisma.agentSkillOperationItem.update({
@@ -1033,6 +1036,46 @@ describeDatabase("agent access persistence", () => {
     await expect(prisma.exercise.count({ where: { skillId: stalled.skill.id } })).resolves.toBe(3);
     await expect(prisma.skill.findUniqueOrThrow({ where: { id: stalled.skill.id } }))
       .resolves.toMatchObject({ status: SkillStatus.ACTIVE, firstIntroducedAt: null });
+  }, 30_000);
+
+  it("retries when source OCR is still owned by another worker", async () => {
+    const fixture = await createConnection("pending-source-ocr");
+    const stalled = await createQueuedDraftOperation(fixture, "pending-source-ocr");
+    const source = await prisma.sourceFile.create({
+      data: {
+        userId: fixture.userId,
+        kind: SourceFileKind.IMAGE,
+        status: SourceFileStatus.READY,
+        originalName: "pending-source.png",
+        mimeType: "image/png",
+        byteSize: 4,
+        storageBucket: "staging-private",
+        storageKey: `agent-test/${runId}/pending-source.png`,
+      },
+    });
+    await prisma.skillSourceRef.create({
+      data: { userId: fixture.userId, skillId: stalled.skill.id, sourceFileId: source.id },
+    });
+
+    await expect(runAgentSkillOperationJob({
+      userId: fixture.userId,
+      operationId: stalled.operation.id,
+      deadlineAt: new Date(Date.now() + 120_000),
+    }, {
+      activationOptions: {
+        ...quickActivationOptions(),
+        sourceMediaLoader: async () => { throw new MaterialEvidencePendingError(); },
+      },
+    })).resolves.toMatchObject({ status: "processed" });
+    await expect(prisma.agentSkillOperationItem.findUniqueOrThrow({ where: { id: stalled.item.id } }))
+      .resolves.toMatchObject({
+        status: AgentOperationItemStatus.QUEUED,
+        errorCode: "TRANSIENT_WORKER_FAILURE",
+        retryCount: 1,
+        createdSkillId: stalled.skill.id,
+      });
+    await expect(prisma.generationJob.findFirstOrThrow({ where: { skillId: stalled.skill.id } }))
+      .resolves.toMatchObject({ status: GenerationJobStatus.FAILED });
   }, 30_000);
 
   it("recovers a candidate activation whose publication transaction times out", async () => {

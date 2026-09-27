@@ -54,6 +54,7 @@ import {
 } from "@/lib/gemini";
 import {
   loadLocalizedMaterialEvidence,
+  MaterialEvidencePendingError,
   type LocalizedMaterialEvidenceLoader,
   type LocalizedMaterialSourceRef,
 } from "@/lib/materials/evidence";
@@ -2882,7 +2883,7 @@ async function runActivationStage<T>(input: {
         remainingMs - AGENT_OPERATION_CLEANUP_MARGIN_MS <= input.maxTimeoutMs
       ) cause = "delivery-soft-deadline";
       else cause = "stage-timeout";
-    }
+    } else if (error instanceof MaterialEvidencePendingError) cause = "source-ocr-in-progress";
     console.warn(JSON.stringify({
       ...fields,
       outcome: "failed",
@@ -3157,6 +3158,7 @@ export async function activateSkillDraft(
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
     const message = buildSourceMediaLoadFailureMessage(error);
+    const retryable = isJobStageTimeoutError(error) || error instanceof MaterialEvidencePendingError;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
       acceptedCount: 0,
@@ -3176,7 +3178,7 @@ export async function activateSkillDraft(
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
-      retryable: isJobStageTimeoutError(error),
+      retryable,
     };
   }
 

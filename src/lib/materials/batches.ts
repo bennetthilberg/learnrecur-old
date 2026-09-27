@@ -1943,6 +1943,7 @@ export async function runMaterialBatchActivationJob(input: {
   attempt?: number;
   maxAttempts?: number;
   now?: Date;
+  deadlineAt?: Date;
   generateChoiceExercises?: ChoiceExerciseGenerator;
   verifyChoiceExercises?: ChoiceExerciseVerifier;
   sourceMediaLoader?: SourceMediaContextLoader;
@@ -2002,6 +2003,7 @@ export async function runMaterialBatchActivationJob(input: {
       skillId: slot.skillId,
       generationJobId: slot.generationJobId,
       now,
+      deadlineAt: input.deadlineAt,
       generateChoiceExercises: input.generateChoiceExercises,
       verifyChoiceExercises: input.verifyChoiceExercises,
       sourceMediaLoader: input.sourceMediaLoader,

@@ -4289,6 +4289,48 @@ describeDatabase("material multi-skill drafting", () => {
     expect(refillSourceContext).not.toContain("UNRELATED CHAPTER SIX SOURCE TEXT");
   });
 
+  it("keeps material activation inside the worker cleanup margin", async () => {
+    const ready = await createReadyBatch([{
+      key: "material-activation-deadline",
+      title: "Material activation deadline fixture",
+      objective: "Choose the correct object pronoun from the cited material.",
+      materialSectionIds: [directSectionId],
+      evidenceChunkIds: [directChunkId],
+    }]);
+    const events: MaterialBatchActivationEvent[] = [];
+    await queueMaterialBatchActivation({
+      userId,
+      input: { batchId: ready.id, itemIds: [ready.items[0].id] },
+      now: new Date(),
+      eventSender: {
+        async sendMaterialBatchActivationRequested(payload) { events.push(payload); },
+      },
+    });
+    const generator = vi.fn(async () => ({ exercises: [generatedChoiceExercise(91)] }));
+
+    await expect(runMaterialBatchActivationJob({
+      userId,
+      batchId: ready.id,
+      itemId: ready.items[0].id,
+      generationJobId: events[0].generationJobId,
+      now: new Date(),
+      deadlineAt: new Date(Date.now() + 59_000),
+      attempt: 0,
+      maxAttempts: 2,
+      generateChoiceExercises: generator,
+      verifyChoiceExercises: acceptAllChoiceExercises,
+      model: "fixture-model",
+      sourceEvidenceLoader,
+    })).rejects.toMatchObject({ retryable: true });
+    expect(generator).not.toHaveBeenCalled();
+    await expect(prisma.skillDraftBatchItem.findUniqueOrThrow({ where: { id: ready.items[0].id } }))
+      .resolves.toMatchObject({
+        status: SkillDraftBatchItemStatus.ACTIVATING,
+        generationClaimId: null,
+        errorCode: "ACTIVATION_RETRYING_TRANSIENT_FAILURE",
+      });
+  });
+
   it("returns an edited batch draft to review before its reserved activation starts", async () => {
     const ready = await createReadyBatch([
       {

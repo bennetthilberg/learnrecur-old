@@ -1443,7 +1443,7 @@ async function activateCreatedDraft(
       stage: "agent candidate verification",
     });
     if (verification.status === "not-verified" && verification.retryable) {
-      await releaseClaimForRetry({ itemId, userId, claimToken, now });
+      await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
       return;
     }
     if (verification.status === "verified") {
@@ -1558,7 +1558,7 @@ async function activateCreatedDraft(
         select: { id: true },
       });
       if (!runningActivation) {
-        await releaseClaimForRetry({ itemId, userId, claimToken, now });
+        await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
         return;
       }
     }
@@ -1567,7 +1567,7 @@ async function activateCreatedDraft(
       return;
     }
     if ("retryable" in result && result.retryable) {
-      await releaseClaimForRetry({ itemId, userId, claimToken, now });
+      await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
       return;
     }
     await failItem(itemId, userId, result.reason, now, claimToken);

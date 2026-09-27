@@ -46,6 +46,13 @@ const MAX_MATERIAL_SOURCE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_CONTEXT_CHARACTER_LIMIT = 4_000;
 export const MAX_LAZY_OCR_PAGES_PER_RUN = 8;
 
+export class MaterialEvidencePendingError extends Error {
+  constructor() {
+    super("Source page OCR is still running. The activation can be retried.");
+    this.name = "MaterialEvidencePendingError";
+  }
+}
+
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw signal.reason instanceof Error
@@ -343,6 +350,29 @@ export async function ensureMaterialPageOcr(input: {
     storageBucket,
   } = claimResult.ocrConfiguration;
   const candidateIds = claimedCandidates.map((page) => page.id);
+  const releaseAbortedClaim = () => prisma.materialPage.updateMany({
+    where: {
+      id: { in: candidateIds },
+      userId: input.userId,
+      materialRevisionId: input.materialRevisionId,
+      textStatus: MaterialPageTextStatus.OCR_PROCESSING,
+      updatedAt: now,
+    },
+    data: {
+      textStatus: MaterialPageTextStatus.NEEDS_OCR,
+      metadata: { reason: "worker-deadline", retryable: true },
+    },
+  });
+  const onAbort = () => {
+    void releaseAbortedClaim().catch(() => {
+      console.warn(JSON.stringify({
+        component: "material-ocr",
+        materialRevisionId: input.materialRevisionId,
+        outcome: "abort-claim-release-failed",
+      }));
+    });
+  };
+  input.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     throwIfAborted(input.signal);
@@ -454,7 +484,7 @@ export async function ensureMaterialPageOcr(input: {
     };
   } catch (error) {
     const canceled = input.signal?.aborted === true;
-    const failed = await prisma.materialPage.updateMany({
+    const failed = canceled ? await releaseAbortedClaim() : await prisma.materialPage.updateMany({
       where: {
         id: { in: candidateIds },
         userId: input.userId,
@@ -462,18 +492,13 @@ export async function ensureMaterialPageOcr(input: {
         textStatus: MaterialPageTextStatus.OCR_PROCESSING,
         updatedAt: now,
       },
-      data: canceled
-        ? {
-            textStatus: MaterialPageTextStatus.NEEDS_OCR,
-            metadata: { reason: "worker-deadline", retryable: true },
-          }
-        : {
-            textStatus: MaterialPageTextStatus.OCR_FAILED,
-            metadata: {
-              reason: error instanceof Error ? error.message.slice(0, 500) : "OCR failed",
-              failedAt: now.toISOString(),
-            },
-          },
+      data: {
+        textStatus: MaterialPageTextStatus.OCR_FAILED,
+        metadata: {
+          reason: error instanceof Error ? error.message.slice(0, 500) : "OCR failed",
+          failedAt: now.toISOString(),
+        },
+      },
     });
     if (canceled) {
       throw input.signal?.reason instanceof Error
@@ -485,6 +510,8 @@ export async function ensureMaterialPageOcr(input: {
       processedPageCount: 0,
       failedPageCount: failed.count,
     };
+  } finally {
+    input.signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -634,7 +661,7 @@ export async function loadLocalizedMaterialEvidence(input: {
 
   for (const sourceRef of uniqueBy(materialRefs, (value) => value.sourceFile.id)) {
     if (sourceRef.locator.source.kind === "pdf") {
-      await ensureMaterialPageOcr({
+      const ocr = await ensureMaterialPageOcr({
         userId: input.userId,
         materialRevisionId: sourceRef.locator.materialRevisionId,
         sourceFile: sourceRef.sourceFile,
@@ -642,6 +669,7 @@ export async function loadLocalizedMaterialEvidence(input: {
         storage: input.storage,
         signal: input.signal,
       });
+      if (ocr.status === "in-progress") throw new MaterialEvidencePendingError();
     }
   }
 

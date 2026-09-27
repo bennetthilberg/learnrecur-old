@@ -530,10 +530,16 @@ uses the effective `now` value. The old replacement job's `completedAt` was
 10.3 seconds before its `createdAt`, consistent with the prior captured-time
 write.
 
+The automatic PR review found two adjacent gaps. Material-batch activation
+now passes its worker deadline into the same activation stages. A PDF OCR
+claim is released when its stage aborts, even if the underlying generator
+ignores cancellation; a claim still held by another worker is reported as
+retryable pending evidence instead of a permanent missing-source error.
+
 The source-read timeout, cooperative and noncooperative abort, claimed-job
 exception, delayed retry timestamp, concurrent worker, stale recovery, and
 published-sibling paths pass local integration tests with fake providers. The
-full database suite passed 579 tests across 46 files on a temporary local
+full database suite passed 582 tests across 46 files on a temporary local
 Postgres 18 database. After reinstalling the exact lockfile dependencies, all
 1,353 unit tests passed across 151 files. Lint, Prisma validation/generation,
 the Next.js build, and the AWS worker package build passed. The earlier local

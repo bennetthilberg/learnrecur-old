@@ -54,9 +54,11 @@ import {
 } from "@/lib/gemini";
 import {
   loadLocalizedMaterialEvidence,
+  MaterialEvidencePendingError,
   type LocalizedMaterialEvidenceLoader,
   type LocalizedMaterialSourceRef,
 } from "@/lib/materials/evidence";
+import { BoundedActivationReadError, withBoundedActivationRead } from "@/lib/prisma-bounded-read";
 import {
   buildMetaMuseDataUrl,
   MAX_META_MUSE_INLINE_FILE_BYTES,
@@ -121,6 +123,8 @@ import {
   ACTIVATION_PUBLISH_TRANSACTION_MAX_WAIT_MS,
   ACTIVATION_PUBLISH_TRANSACTION_TIMEOUT_MS,
   ACTIVATION_PROVIDER_CHAIN_TIMEOUT_MS,
+  ACTIVATION_SOURCE_EVIDENCE_TIMEOUT_MS,
+  ACTIVATION_RECENT_HISTORY_TIMEOUT_MS,
   CHOICE_VERIFICATION_TIMEOUT_MS,
   GENERATION_TIMEOUT_MS,
   ACTIVATION_RESERVATION_TRANSACTION_MAX_WAIT_MS,
@@ -462,6 +466,7 @@ export type SourceMediaContextSourceFile = {
 
 export type SourceMediaContextLoader = (input: {
   sourceFiles: SourceMediaContextSourceFile[];
+  signal?: AbortSignal;
 }) => Promise<SourceMediaContext[]>;
 
 export type SkillSourceEvidenceLoader = LocalizedMaterialEvidenceLoader;
@@ -616,6 +621,9 @@ export type ActivateSkillDraftInput = {
     fingerprint: string;
   };
   now: Date;
+  /** Wall clock for operational timestamps; `now` remains the schedule-effective time. */
+  eventNow?: () => Date;
+  onGenerationJobClaimed?: (generationJobId: string) => void;
   deadlineAt?: Date;
   signal?: AbortSignal;
   generationJobId?: string;
@@ -2459,9 +2467,11 @@ async function markPastedSourceFailed({
 export async function loadSourceMediaContextForSourceFiles({
   sourceFiles,
   storage,
+  signal,
 }: {
   sourceFiles: SourceMediaContextSourceFile[];
   storage?: SourceObjectStorage;
+  signal?: AbortSignal;
 }): Promise<SourceMediaContext[]> {
   const uploadBackedSources = sourceFiles.filter(shouldAttachOriginalSourceMedia);
 
@@ -2497,6 +2507,7 @@ export async function loadSourceMediaContextForSourceFiles({
       key: sourceFile.storageKey,
       bucket: sourceFile.storageBucket,
       maxBytes: MAX_SOURCE_UPLOAD_BYTES,
+      abortSignal: signal,
     });
 
     if (bytes.length === 0 || bytes.length > MAX_SOURCE_UPLOAD_BYTES) {
@@ -2523,9 +2534,11 @@ export async function loadSourceMediaContextForSourceFiles({
 async function resolveSourceMediaContext({
   sourceFiles,
   sourceMediaLoader,
+  signal,
 }: {
   sourceFiles: SourceMediaContextSourceFile[];
   sourceMediaLoader?: SourceMediaContextLoader;
+  signal?: AbortSignal;
 }): Promise<SourceMediaContext[]> {
   const attachableSourceFiles = sourceFiles.filter(shouldAttachOriginalSourceMedia);
 
@@ -2534,10 +2547,10 @@ async function resolveSourceMediaContext({
   }
 
   if (sourceMediaLoader) {
-    return sourceMediaLoader({ sourceFiles: attachableSourceFiles });
+    return sourceMediaLoader({ sourceFiles: attachableSourceFiles, signal });
   }
 
-  return loadSourceMediaContextForSourceFiles({ sourceFiles: attachableSourceFiles });
+  return loadSourceMediaContextForSourceFiles({ sourceFiles: attachableSourceFiles, signal });
 }
 
 async function resolveGroundedSkillSourceEvidence(input: {
@@ -2545,6 +2558,7 @@ async function resolveGroundedSkillSourceEvidence(input: {
   sourceRefs: SkillGenerationSourceRef[];
   sourceMediaLoader?: SourceMediaContextLoader;
   sourceEvidenceLoader?: SkillSourceEvidenceLoader;
+  signal?: AbortSignal;
 }): Promise<{ sourceContext: string | null; sourceMedia: SourceMediaContext[] }> {
   const materialRefs = input.sourceRefs.filter(
     (sourceRef) => Boolean(sourceRef.sourceFile.materialRevisionId),
@@ -2554,6 +2568,7 @@ async function resolveGroundedSkillSourceEvidence(input: {
       ? await (input.sourceEvidenceLoader ?? loadLocalizedMaterialEvidence)({
           userId: input.userId,
           sourceRefs: materialRefs,
+          signal: input.signal,
         })
       : { materialSourceFileIds: [], sourceContext: null, sourceMedia: [] };
   const quickRefs = input.sourceRefs.filter(
@@ -2562,6 +2577,7 @@ async function resolveGroundedSkillSourceEvidence(input: {
   const quickMedia = await resolveSourceMediaContext({
     sourceFiles: quickRefs.map((sourceRef) => sourceRef.sourceFile),
     sourceMediaLoader: input.sourceMediaLoader,
+    signal: input.signal,
   });
   const sourceContext = buildSourceContextExcerpt([
     materialEvidence.sourceContext,
@@ -2820,10 +2836,71 @@ export async function verifyUntrustedAgentExerciseCandidates(
   }
 }
 
+async function runActivationStage<T>(input: {
+  stage: string;
+  userId: string;
+  skillId: string;
+  generationJobId: string;
+  operationItemId?: string;
+  deadlineAt?: Date;
+  parentSignal?: AbortSignal;
+  maxTimeoutMs: number;
+  run: (signal: AbortSignal) => Promise<T>;
+}): Promise<T> {
+  const startedAt = Date.now();
+  const remainingMs = input.deadlineAt ? input.deadlineAt.getTime() - startedAt : undefined;
+  const fields = {
+    component: "skill-activation",
+    stage: input.stage,
+    userId: input.userId,
+    skillId: input.skillId,
+    generationJobId: input.generationJobId,
+    operationItemId: input.operationItemId,
+    deadlineRemainingMs: remainingMs,
+  };
+  console.info(JSON.stringify({ ...fields, outcome: "started" }));
+  try {
+    const result = await withAbortableTimeout({
+      run: input.run,
+      timeoutMs: getJobStageTimeoutMs({
+        deadlineAt: input.deadlineAt,
+        cleanupMarginMs: input.deadlineAt ? AGENT_OPERATION_CLEANUP_MARGIN_MS : 0,
+        maxTimeoutMs: input.maxTimeoutMs,
+        stage: input.stage,
+      }),
+      message: `${input.stage} timed out`,
+      stage: input.stage,
+      parentSignal: input.parentSignal,
+    });
+    console.info(JSON.stringify({ ...fields, outcome: "completed", durationMs: Date.now() - startedAt }));
+    return result;
+  } catch (error) {
+    let cause = "stage-error";
+    if (isJobStageTimeoutError(error)) {
+      if (input.parentSignal?.aborted) cause = "delivery-abort";
+      else if (error.stage !== input.stage) cause = "provider-timeout";
+      else if (
+        remainingMs !== undefined &&
+        remainingMs - AGENT_OPERATION_CLEANUP_MARGIN_MS <= input.maxTimeoutMs
+      ) cause = "delivery-soft-deadline";
+      else cause = "stage-timeout";
+    } else if (error instanceof MaterialEvidencePendingError) cause = "source-ocr-in-progress";
+    else if (error instanceof BoundedActivationReadError) cause = "database-read-failure";
+    console.warn(JSON.stringify({
+      ...fields,
+      outcome: "failed",
+      durationMs: Date.now() - startedAt,
+      cause,
+    }));
+    throw error;
+  }
+}
+
 export async function activateSkillDraft(
   input: ActivateSkillDraftInput,
 ): Promise<SkillActivationResult> {
   const prisma = getPrisma();
+  const eventNow = input.eventNow ?? (() => new Date());
   const providerUsage = createAiProviderUsageTracker();
   const setup = resolveActivationSetup(input, providerUsage.record);
   let reservationTimeoutMs: number;
@@ -3005,7 +3082,7 @@ export async function activateSkillDraft(
         userId: input.userId,
         skillId: skill.id,
         setup,
-        now: input.now,
+        now: eventNow(),
       });
 
     if (generationJobResult.status === "not-ready") {
@@ -3047,6 +3124,7 @@ export async function activateSkillDraft(
   }
 
   const { draftFingerprint, generationJob, parsedAgentCandidates, skill } = reservation;
+  input.onGenerationJobClaimed?.(generationJob.id);
 
   if (setup.status === "missing-env") {
     return {
@@ -3061,21 +3139,38 @@ export async function activateSkillDraft(
   let sourceMedia: SourceMediaContext[];
 
   try {
-    const sourceEvidence = await resolveGroundedSkillSourceEvidence({
+    const sourceEvidence = await runActivationStage({
+      stage: "source-evidence",
       userId: input.userId,
-      sourceRefs: skill.sourceRefs,
-      sourceMediaLoader: input.sourceMediaLoader,
-      sourceEvidenceLoader: input.sourceEvidenceLoader,
+      skillId: skill.id,
+      generationJobId: generationJob.id,
+      operationItemId: input.verifiedAgentCandidateItemId,
+      deadlineAt: input.deadlineAt,
+      parentSignal: input.signal,
+      maxTimeoutMs: ACTIVATION_SOURCE_EVIDENCE_TIMEOUT_MS,
+      run: (signal) => resolveGroundedSkillSourceEvidence({
+        userId: input.userId,
+        sourceRefs: skill.sourceRefs,
+        sourceMediaLoader: input.sourceMediaLoader,
+        sourceEvidenceLoader: input.sourceEvidenceLoader,
+        signal,
+      }),
     });
     sourceContext = sourceEvidence.sourceContext;
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
     const message = buildSourceMediaLoadFailureMessage(error);
+    const retryable = isJobStageTimeoutError(error) ||
+      error instanceof MaterialEvidencePendingError ||
+      error instanceof BoundedActivationReadError;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      failureCategory: isJobStageTimeoutError(error)
+        ? GenerationFailureCategory.TIMEOUT
+        : undefined,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -3087,11 +3182,52 @@ export async function activateSkillDraft(
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
+      retryable,
+    };
+  }
+
+  let recentEvidence: Awaited<ReturnType<typeof loadGenerationRecentEvidence>>;
+  try {
+    recentEvidence = await runActivationStage({
+      stage: "recent-history",
+      userId: input.userId,
+      skillId: skill.id,
+      generationJobId: generationJob.id,
+      operationItemId: input.verifiedAgentCandidateItemId,
+      deadlineAt: input.deadlineAt,
+      parentSignal: input.signal,
+      maxTimeoutMs: ACTIVATION_RECENT_HISTORY_TIMEOUT_MS,
+      run: () => withBoundedActivationRead((tx) => loadGenerationRecentEvidence({
+        userId: input.userId,
+        skillId: skill.id,
+        now: input.now,
+        prisma: tx,
+      })),
+    });
+  } catch (error) {
+    const message = `Recent generation history could not be loaded: ${formatEnvError(error)}`;
+    const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
+      message,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      now: eventNow(),
+      failureCategory: isJobStageTimeoutError(error)
+        ? GenerationFailureCategory.TIMEOUT
+        : undefined,
+      providerUsage: providerUsage.latest(),
+    });
+    if (!jobFailed) return activationSuperseded(generationJob.id);
+    return {
+      status: "not-activated",
+      reason: "generation-failed",
+      message,
+      generationJobId: generationJob.id,
+      retryable: true,
     };
   }
 
   const qualityContextResult = safeBuildGenerationQualityContext({
-    recentEvidence: await loadGenerationRecentEvidence({ userId: input.userId, skillId: skill.id, now: input.now }),
+    recentEvidence,
     skill,
     sourceContext,
     sourceEvidence: skill.sourceRefs.map((sourceRef) => ({
@@ -3107,7 +3243,7 @@ export async function activateSkillDraft(
       message: qualityContextResult.message,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
       failureCategory: qualityContextResult.failureCategory,
       providerUsage: providerUsage.latest(),
     });
@@ -3126,7 +3262,15 @@ export async function activateSkillDraft(
   let rawGeneration: unknown;
 
   try {
-    rawGeneration = await withAbortableTimeout({
+    rawGeneration = await runActivationStage({
+      stage: "exercise-generation",
+      userId: input.userId,
+      skillId: skill.id,
+      generationJobId: generationJob.id,
+      operationItemId: input.verifiedAgentCandidateItemId,
+      deadlineAt: input.deadlineAt,
+      parentSignal: input.signal,
+      maxTimeoutMs: ACTIVATION_PROVIDER_CHAIN_TIMEOUT_MS,
       run: (signal) => setup.generateChoiceExercises({
         skill,
         sourceContext,
@@ -3136,15 +3280,6 @@ export async function activateSkillDraft(
         requestedCount: REQUESTED_ACTIVATION_EXERCISES,
         signal,
       }),
-      timeoutMs: getJobStageTimeoutMs({
-        deadlineAt: input.deadlineAt,
-        cleanupMarginMs: AGENT_OPERATION_CLEANUP_MARGIN_MS,
-        maxTimeoutMs: ACTIVATION_PROVIDER_CHAIN_TIMEOUT_MS,
-        stage: "activation exercise generation",
-      }),
-      message: "generateChoiceExercises timed out",
-      stage: "activation exercise generation",
-      parentSignal: input.signal,
     });
   } catch (error) {
     const message = `Exercise generation failed: ${formatEnvError(error)}`;
@@ -3152,7 +3287,10 @@ export async function activateSkillDraft(
       message,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      failureCategory: isJobStageTimeoutError(error)
+        ? GenerationFailureCategory.TIMEOUT
+        : undefined,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -3188,7 +3326,7 @@ export async function activateSkillDraft(
       message: validation.message,
       acceptedCount: validation.validCount,
       rejectedCount: validation.rejectedCount,
-      now: input.now,
+      now: eventNow(),
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -3218,7 +3356,15 @@ export async function activateSkillDraft(
   let rawVerification: unknown;
 
   try {
-    rawVerification = await withAbortableTimeout({
+    rawVerification = await runActivationStage({
+      stage: "exercise-verification",
+      userId: input.userId,
+      skillId: skill.id,
+      generationJobId: generationJob.id,
+      operationItemId: input.verifiedAgentCandidateItemId,
+      deadlineAt: input.deadlineAt,
+      parentSignal: input.signal,
+      maxTimeoutMs: CHOICE_VERIFICATION_TIMEOUT_MS,
       run: (signal) => setup.verifyChoiceExercises({
         skill,
         sourceContext,
@@ -3228,15 +3374,6 @@ export async function activateSkillDraft(
         candidates,
         signal,
       }),
-      timeoutMs: getJobStageTimeoutMs({
-        deadlineAt: input.deadlineAt,
-        cleanupMarginMs: AGENT_OPERATION_CLEANUP_MARGIN_MS,
-        maxTimeoutMs: CHOICE_VERIFICATION_TIMEOUT_MS,
-        stage: "activation exercise verification",
-      }),
-      message: "verifyChoiceExercises timed out",
-      stage: "activation exercise verification",
-      parentSignal: input.signal,
     });
   } catch (error) {
     const message = `Exercise verification failed: ${formatEnvError(error)}`;
@@ -3244,7 +3381,10 @@ export async function activateSkillDraft(
       message,
       acceptedCount: 0,
       rejectedCount: validation.rejectedCount + validation.exercises.length,
-      now: input.now,
+      now: eventNow(),
+      failureCategory: isJobStageTimeoutError(error)
+        ? GenerationFailureCategory.TIMEOUT
+        : undefined,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -3270,7 +3410,7 @@ export async function activateSkillDraft(
       message: verification.message,
       acceptedCount: verification.verifiedCount,
       rejectedCount: validation.rejectedCount + verification.rejectedCount,
-      now: input.now,
+      now: eventNow(),
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -3319,7 +3459,7 @@ export async function activateSkillDraft(
       message,
       acceptedCount: 0,
       rejectedCount: validation.rejectedCount + verification.exercises.length,
-      now: input.now,
+      now: eventNow(),
       failureCategory: isJobStageTimeoutError(error) || errorCode === "P2028"
         ? GenerationFailureCategory.TIMEOUT
         : GenerationFailureCategory.UNKNOWN,
@@ -3405,7 +3545,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: "Skill is no longer a draft.",
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3429,7 +3569,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: message,
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3457,7 +3597,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: message,
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3486,7 +3626,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: message,
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3512,7 +3652,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: message,
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3549,7 +3689,7 @@ export async function activateSkillDraft(
           stage: GenerationJobStage.FAILED,
           failureCategory: GenerationFailureCategory.CANCELED,
           errorMessage: "Skill is no longer a draft.",
-          completedAt: input.now,
+          completedAt: eventNow(),
         },
       });
 
@@ -3646,7 +3786,7 @@ export async function activateSkillDraft(
         failureCategory: GenerationFailureCategory.NONE,
         acceptedCount: fallbackChoices.length + parsedAgentCandidates.length,
         rejectedCount: validation.rejectedCount + verification.rejectedCount,
-        completedAt: input.now,
+        completedAt: eventNow(),
       },
     });
     if (publishedJob.count !== 1) {
@@ -3678,7 +3818,7 @@ export async function activateSkillDraft(
       tx,
       userId: input.userId,
       skillId: skill.id,
-      now: input.now,
+      now: eventNow(),
     });
 
     return {

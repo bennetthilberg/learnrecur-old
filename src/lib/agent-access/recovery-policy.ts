@@ -4,6 +4,7 @@ import {
   AGENT_SKILL_OPERATION_SOFT_DEADLINE_MS,
 } from "@/lib/jobs/timing";
 import { ACTIVATION_GENERATION_TIMEOUT_MS } from "@/lib/skills/activation-timing";
+import { JOB_LEASE_SECONDS } from "@/lib/jobs/timing";
 
 /**
  * Activation work must finish well before the Lambda hard timeout. The job
@@ -12,7 +13,7 @@ import { ACTIVATION_GENERATION_TIMEOUT_MS } from "@/lib/skills/activation-timing
  */
 export const AGENT_OPERATION_CLEANUP_MARGIN_MS = 60_000;
 export const AGENT_OPERATION_SOFT_DEADLINE_MS = AGENT_SKILL_OPERATION_SOFT_DEADLINE_MS;
-export const AGENT_OPERATION_STALE_AFTER_MS = 9 * 60_000;
+export const AGENT_OPERATION_STALE_AFTER_MS = JOB_LEASE_SECONDS * 1_000;
 export const AGENT_OPERATION_ITEM_RETRY_LIMIT = 4;
 export const AGENT_OPERATION_RETRY_BASE_DELAY_MS = 30_000;
 export const AGENT_OPERATION_RETRY_MAX_DELAY_MS = 2 * 60_000;

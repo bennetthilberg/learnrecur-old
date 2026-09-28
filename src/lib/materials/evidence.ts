@@ -35,6 +35,7 @@ import {
 } from "@/lib/meta-muse";
 import { resolveOptionalMetaMuseFallbackConfig } from "@/lib/meta-muse-fallback";
 import { getPrisma } from "@/lib/prisma";
+import { withBoundedActivationRead } from "@/lib/prisma-bounded-read";
 import {
   resolveS3SourceObjectStorage,
   type SourceObjectStorage,
@@ -45,6 +46,13 @@ export const MAX_LOCALIZED_PDF_SLICE_BYTES = 49_000_000;
 const MAX_MATERIAL_SOURCE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_CONTEXT_CHARACTER_LIMIT = 4_000;
 export const MAX_LAZY_OCR_PAGES_PER_RUN = 8;
+
+export class MaterialEvidencePendingError extends Error {
+  constructor() {
+    super("Source page OCR is still running. The activation can be retried.");
+    this.name = "MaterialEvidencePendingError";
+  }
+}
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
@@ -103,6 +111,7 @@ export type LocalizedMaterialEvidence = {
 export type LocalizedMaterialEvidenceLoader = (input: {
   userId: string;
   sourceRefs: LocalizedMaterialSourceRef[];
+  signal?: AbortSignal;
 }) => Promise<LocalizedMaterialEvidence>;
 
 type EvidenceChunk = {
@@ -342,6 +351,29 @@ export async function ensureMaterialPageOcr(input: {
     storageBucket,
   } = claimResult.ocrConfiguration;
   const candidateIds = claimedCandidates.map((page) => page.id);
+  const releaseAbortedClaim = () => prisma.materialPage.updateMany({
+    where: {
+      id: { in: candidateIds },
+      userId: input.userId,
+      materialRevisionId: input.materialRevisionId,
+      textStatus: MaterialPageTextStatus.OCR_PROCESSING,
+      updatedAt: now,
+    },
+    data: {
+      textStatus: MaterialPageTextStatus.NEEDS_OCR,
+      metadata: { reason: "worker-deadline", retryable: true },
+    },
+  });
+  const onAbort = () => {
+    void releaseAbortedClaim().catch(() => {
+      console.warn(JSON.stringify({
+        component: "material-ocr",
+        materialRevisionId: input.materialRevisionId,
+        outcome: "abort-claim-release-failed",
+      }));
+    });
+  };
+  input.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     throwIfAborted(input.signal);
@@ -453,7 +485,7 @@ export async function ensureMaterialPageOcr(input: {
     };
   } catch (error) {
     const canceled = input.signal?.aborted === true;
-    const failed = await prisma.materialPage.updateMany({
+    const failed = canceled ? await releaseAbortedClaim() : await prisma.materialPage.updateMany({
       where: {
         id: { in: candidateIds },
         userId: input.userId,
@@ -461,18 +493,13 @@ export async function ensureMaterialPageOcr(input: {
         textStatus: MaterialPageTextStatus.OCR_PROCESSING,
         updatedAt: now,
       },
-      data: canceled
-        ? {
-            textStatus: MaterialPageTextStatus.NEEDS_OCR,
-            metadata: { reason: "worker-deadline", retryable: true },
-          }
-        : {
-            textStatus: MaterialPageTextStatus.OCR_FAILED,
-            metadata: {
-              reason: error instanceof Error ? error.message.slice(0, 500) : "OCR failed",
-              failedAt: now.toISOString(),
-            },
-          },
+      data: {
+        textStatus: MaterialPageTextStatus.OCR_FAILED,
+        metadata: {
+          reason: error instanceof Error ? error.message.slice(0, 500) : "OCR failed",
+          failedAt: now.toISOString(),
+        },
+      },
     });
     if (canceled) {
       throw input.signal?.reason instanceof Error
@@ -484,6 +511,8 @@ export async function ensureMaterialPageOcr(input: {
       processedPageCount: 0,
       failedPageCount: failed.count,
     };
+  } finally {
+    input.signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -612,6 +641,7 @@ export async function loadLocalizedMaterialEvidence(input: {
   userId: string;
   sourceRefs: LocalizedMaterialSourceRef[];
   storage?: SourceObjectStorage;
+  signal?: AbortSignal;
 }): Promise<LocalizedMaterialEvidence> {
   const materialRefs = input.sourceRefs.flatMap((sourceRef) => {
     if (!sourceRef.sourceFile.materialRevisionId) {
@@ -632,17 +662,18 @@ export async function loadLocalizedMaterialEvidence(input: {
 
   for (const sourceRef of uniqueBy(materialRefs, (value) => value.sourceFile.id)) {
     if (sourceRef.locator.source.kind === "pdf") {
-      await ensureMaterialPageOcr({
+      const ocr = await ensureMaterialPageOcr({
         userId: input.userId,
         materialRevisionId: sourceRef.locator.materialRevisionId,
         sourceFile: sourceRef.sourceFile,
         pageRanges: sourceRef.locator.source.pageRanges,
         storage: input.storage,
+        signal: input.signal,
       });
+      if (ocr.status === "in-progress") throw new MaterialEvidencePendingError();
     }
   }
 
-  const prisma = getPrisma();
   const chunkConditions = materialRefs.flatMap((sourceRef) => {
     const chunkIds = sourceRef.locator.evidenceChunkIds.filter(
       (evidenceId) => !parseMaterialPageEvidenceId(evidenceId),
@@ -651,22 +682,6 @@ export async function loadLocalizedMaterialEvidence(input: {
       ? [{ materialRevisionId: sourceRef.locator.materialRevisionId, id: { in: chunkIds } }]
       : [];
   });
-  const chunks = chunkConditions.length
-    ? await prisma.materialChunk.findMany({
-        where: { userId: input.userId, OR: chunkConditions },
-        select: {
-          id: true,
-          materialRevisionId: true,
-          ordinal: true,
-          headingText: true,
-          text: true,
-        },
-      })
-    : [];
-  const chunkKeys = new Set(
-    chunks.map((chunk) => `${chunk.materialRevisionId}\u0000${chunk.id}`),
-  );
-
   const pageConditions = materialRefs.flatMap((sourceRef) =>
     sourceRef.locator.source.kind === "pdf"
       ? sourceRef.locator.source.pageRanges.map((range) => ({
@@ -675,18 +690,40 @@ export async function loadLocalizedMaterialEvidence(input: {
         }))
       : [],
   );
-  const pages = pageConditions.length
-    ? await prisma.materialPage.findMany({
-        where: { userId: input.userId, OR: pageConditions },
-        select: {
-          id: true,
-          materialRevisionId: true,
-          pageNumber: true,
-          ocrText: true,
-          textStatus: true,
-        },
-      })
-    : [];
+  throwIfAborted(input.signal);
+  const { chunks, pages } = await withBoundedActivationRead(async (tx) => {
+    const [chunks, pages] = await Promise.all([
+      chunkConditions.length
+        ? tx.materialChunk.findMany({
+            where: { userId: input.userId, OR: chunkConditions },
+            select: {
+              id: true,
+              materialRevisionId: true,
+              ordinal: true,
+              headingText: true,
+              text: true,
+            },
+          })
+        : [],
+      pageConditions.length
+        ? tx.materialPage.findMany({
+            where: { userId: input.userId, OR: pageConditions },
+            select: {
+              id: true,
+              materialRevisionId: true,
+              pageNumber: true,
+              ocrText: true,
+              textStatus: true,
+            },
+          })
+        : [],
+    ]);
+    return { chunks, pages };
+  });
+  throwIfAborted(input.signal);
+  const chunkKeys = new Set(
+    chunks.map((chunk) => `${chunk.materialRevisionId}\u0000${chunk.id}`),
+  );
   const pageKeys = new Set(
     pages.flatMap((page) =>
       page.textStatus === MaterialPageTextStatus.OCR_READY && page.ocrText
@@ -720,6 +757,7 @@ export async function loadLocalizedMaterialEvidence(input: {
   const sourceMedia = await loadLocalizedPdfMedia({
     materialRefs,
     storage: input.storage,
+    signal: input.signal,
   });
 
   return {
@@ -732,6 +770,7 @@ export async function loadLocalizedMaterialEvidence(input: {
 async function loadLocalizedPdfMedia(input: {
   materialRefs: Array<LocalizedMaterialSourceRef & { locator: SkillSourceLocator }>;
   storage?: SourceObjectStorage;
+  signal?: AbortSignal;
 }): Promise<LocalizedMaterialMedia[]> {
   const refs = uniqueBy(
     input.materialRefs.filter(
@@ -763,6 +802,7 @@ async function loadLocalizedPdfMedia(input: {
       key: sourceRef.sourceFile.storageKey,
       bucket: sourceRef.sourceFile.storageBucket,
       maxBytes: MAX_MATERIAL_SOURCE_BYTES,
+      abortSignal: input.signal,
     });
     if (sourceRef.locator.source.kind !== "pdf") {
       continue;

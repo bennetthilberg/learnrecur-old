@@ -88,6 +88,7 @@ export type PublicAgentOperation = {
     item_id: string;
     client_reference: string;
     status: string;
+    progress_state: AgentItemProgressState;
     proposed_title: string | null;
     duplicate_confidence: string | null;
     source_reference_outcome: Prisma.JsonValue | null;
@@ -97,6 +98,28 @@ export type PublicAgentOperation = {
     retry_count: number;
   }>;
 };
+
+export type AgentItemProgressState = "working" | "waiting_for_retry" | "needs_action" | "ready" | "stopped";
+
+export function getAgentItemProgressState(item: {
+  status: AgentOperationItemStatus;
+  errorCode: string | null;
+}): AgentItemProgressState {
+  if (item.status === AgentOperationItemStatus.ACTIVE || item.status === AgentOperationItemStatus.REUSED) {
+    return "ready";
+  }
+  if (item.status === AgentOperationItemStatus.CANCELED) return "stopped";
+  if (
+    item.status === AgentOperationItemStatus.FAILED ||
+    item.status === AgentOperationItemStatus.NEEDS_INPUT ||
+    item.status === AgentOperationItemStatus.NEEDS_REVIEW
+  ) return "needs_action";
+  if (
+    item.status === AgentOperationItemStatus.QUEUED &&
+    (item.errorCode === "TRANSIENT_WORKER_FAILURE" || item.errorCode === "STALE_WORKER_RECOVERY")
+  ) return "waiting_for_retry";
+  return "working";
+}
 
 export class AgentOperationError extends Error {
   constructor(
@@ -716,6 +739,7 @@ export function serializeAgentOperation(
       item_id: item.id,
       client_reference: item.clientReference,
       status: item.status.toLocaleLowerCase("en-US"),
+      progress_state: getAgentItemProgressState(item),
       proposed_title: item.proposedTitle,
       duplicate_confidence: item.duplicateConfidence,
       source_reference_outcome: item.sourceReferenceOutcome,

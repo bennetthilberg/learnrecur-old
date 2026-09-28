@@ -14,6 +14,7 @@ import {
 import {
   ensureMaterialPageOcr,
   loadLocalizedMaterialEvidence,
+  MaterialEvidencePendingError,
 } from "@/lib/materials/evidence";
 import { planMaterialSkills } from "@/lib/materials/batches";
 import {
@@ -501,11 +502,74 @@ describeDatabase("localized material OCR evidence", () => {
       expect(generator).not.toHaveBeenCalled();
       await expect(prisma.materialPage.findUniqueOrThrow({ where: { id: page.id } }))
         .resolves.toMatchObject({ textStatus: MaterialPageTextStatus.OCR_PROCESSING });
+      await expect(loadLocalizedMaterialEvidence({
+        userId,
+        storage: createStorage(pdfBytes),
+        sourceRefs: [{
+          sourceFile,
+          locator: {
+            version: 1,
+            materialRevisionId,
+            materialSectionIds: [materialSectionId],
+            evidenceChunkIds: [seedChunkId],
+            source: { kind: "pdf", pageRanges: [{ start: 3, end: 3 }] },
+          },
+        }],
+      })).rejects.toBeInstanceOf(MaterialEvidencePendingError);
     } finally {
       await prisma.materialPage.update({
         where: { id: page.id },
         data: previousPageState,
       });
+    }
+  });
+
+  it("releases an OCR claim when the generator ignores abort", async () => {
+    const page = await prisma.materialPage.findFirstOrThrow({
+      where: { userId, materialRevisionId, pageNumber: 5 },
+    });
+    const previousPageState = {
+      textStatus: page.textStatus,
+      ocrText: page.ocrText,
+      contentHash: page.contentHash,
+      tokenEstimate: page.tokenEstimate,
+      metadata: page.metadata === null ? Prisma.JsonNull : page.metadata as Prisma.InputJsonValue,
+    };
+    await prisma.materialPage.update({
+      where: { id: page.id },
+      data: { textStatus: MaterialPageTextStatus.NEEDS_OCR, ocrText: null, metadata: {} },
+    });
+    const controller = new AbortController();
+    const canceled = new Error("source stage timed out");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let releaseGenerator!: () => void;
+    const generatorResult = new Promise<unknown>((resolve) => {
+      releaseGenerator = () => resolve({ pages: [{ pageNumber: 5, text: "late OCR result" }] });
+    });
+    try {
+      const ocr = ensureMaterialPageOcr({
+        userId,
+        materialRevisionId,
+        sourceFile,
+        pageRanges: [{ start: 5, end: 5 }],
+        storage: createStorage(pdfBytes),
+        signal: controller.signal,
+        ocrGenerator: async () => { markStarted(); return generatorResult; },
+      });
+      await started;
+      controller.abort(canceled);
+      await vi.waitFor(async () => {
+        await expect(prisma.materialPage.findUniqueOrThrow({ where: { id: page.id } }))
+          .resolves.toMatchObject({ textStatus: MaterialPageTextStatus.NEEDS_OCR });
+      });
+      releaseGenerator();
+      await expect(ocr).rejects.toBe(canceled);
+      await expect(prisma.materialPage.findUniqueOrThrow({ where: { id: page.id } }))
+        .resolves.toMatchObject({ textStatus: MaterialPageTextStatus.NEEDS_OCR, ocrText: null });
+    } finally {
+      releaseGenerator();
+      await prisma.materialPage.update({ where: { id: page.id }, data: previousPageState });
     }
   });
 

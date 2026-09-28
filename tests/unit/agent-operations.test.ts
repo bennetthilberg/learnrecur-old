@@ -2,9 +2,25 @@ import { describe, expect, it } from "vitest";
 
 import { AgentOperationItemStatus, AgentOperationStatus } from "@/generated/prisma/client";
 import {
+  getAgentItemProgressState,
   isRetryableAgentItemError,
   reduceAgentOperationStatus,
 } from "@/lib/agent-access/operations";
+
+describe("getAgentItemProgressState", () => {
+  it.each([
+    [AgentOperationItemStatus.ACTIVATING, "ACTIVATION_WAITING", "working"],
+    [AgentOperationItemStatus.QUEUED, null, "working"],
+    [AgentOperationItemStatus.QUEUED, "TRANSIENT_WORKER_FAILURE", "waiting_for_retry"],
+    [AgentOperationItemStatus.QUEUED, "STALE_WORKER_RECOVERY", "waiting_for_retry"],
+    [AgentOperationItemStatus.NEEDS_REVIEW, null, "needs_action"],
+    [AgentOperationItemStatus.FAILED, "TIMEOUT", "needs_action"],
+    [AgentOperationItemStatus.ACTIVE, null, "ready"],
+    [AgentOperationItemStatus.CANCELED, null, "stopped"],
+  ] as const)("maps %s with %s to %s", (status, errorCode, expected) => {
+    expect(getAgentItemProgressState({ status, errorCode })).toBe(expected);
+  });
+});
 
 describe("reduceAgentOperationStatus", () => {
   it.each([

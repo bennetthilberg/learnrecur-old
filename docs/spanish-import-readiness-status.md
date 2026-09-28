@@ -1,6 +1,6 @@
 # Spanish import readiness status
 
-Updated 2026-09-24 for the worker deadline blocker follow-up. This is a
+Updated 2026-09-26 for the activation latency investigation. This is a
 work-in-progress checkpoint, not a release receipt.
 
 The implementation provides the bounded, auditable plumbing for a future
@@ -487,3 +487,70 @@ the Postgres connection timeout. A later read-only database check found no
 durable delivery row for that envelope and connected normally. The worker
 retry, SQS redrive, and Muse scan-limit changes in this PR remain undeployed
 at this checkpoint.
+
+### Activation latency follow-up — 2026-09-26
+
+The nine-skill operation `cmuitzv1x000n04l9jywkid48` completed with nine active
+skills. Its slow item `cmuitzv2b000p04l9surlfbcn` was stranded after an early
+worker failure and recovered by maintenance at 20:33:14 UTC. The first
+generation job `cmuiu0aip000202jwnhlnz9cw` remained at checkpoint `claimed`
+until recovery marked it `FAILED`/`TIMEOUT`. The replacement job
+`cmuiuk9ne000002jtdkmya0d3` succeeded. Read-only production checks found
+the skill active with seven verified exercises and no introduction or review.
+Do not submit this item again.
+
+CloudWatch retained the delivery sequence. Four deliveries of the first event
+ran between 20:17 and 20:22 UTC. The first three logged
+`JOB_EXECUTION_FAILED` after short invocations, while the fourth completed.
+Maintenance at 20:18 also failed three times; the 20:23 and 20:28 scans found
+no stale item. The 20:33 scan requeued the item. No ten-minute Lambda invocation
+appears for this item. The logs do not include the underlying exception, so
+the exact cause of the first failure remains unverified. The observed failure
+mode is an exception after generation-job claim that left a `RUNNING` job behind.
+The deployed worker had a 600-second timeout and enabled SQS mapping and
+schedules. Its Lambda `CodeSha256` was
+`wVbj5dYHQcfLEi9GSh1cq2uwkPmHWJpVB+4HLkR/FMk=`; the local jobs package did
+not match that artifact, so source-to-artifact equivalence is unverified.
+The deployed maintenance schedule is enabled at `rate(5 minutes)` with no
+flexible window. Five-minute SQS metric buckets from 20:15–20:40 UTC put the
+main queue's oldest-message maximum at 249 seconds and the jobs DLQ visible
+count between one and two. Those queue-wide metrics cannot identify this
+item's FIFO group or explain its first worker exception.
+
+The current branch adds 30-second source-evidence and 15-second recent-history
+deadlines before the existing generation and verification limits. Stage logs
+record safe IDs, duration, remaining deadline, and failure cause. A worker
+exception after claim now conditionally fails only its own generation job,
+then releases the item for bounded retry. Recovery keeps the claim-token and
+generation-job fences and waits longer than the 600-second live Lambda before
+reclaiming an apparently dead worker. MCP item progress now says whether an
+item is working, waiting for retry, needs action, ready, or stopped. Operational
+job and operation completion timestamps use wall-clock time; scheduling still
+uses the effective `now` value. The old replacement job's `completedAt` was
+10.3 seconds before its `createdAt`, consistent with the prior captured-time
+write.
+
+The automatic PR review found two adjacent gaps. Material-batch activation
+now passes its worker deadline into the same activation stages. A PDF OCR
+claim is released when its stage aborts, even if the underlying generator
+ignores cancellation; a claim still held by another worker is reported as
+retryable pending evidence instead of a permanent missing-source error.
+Recent-history and material-evidence reads now use short PostgreSQL statement
+deadlines inside read transactions, so a noncooperative database query cannot
+hold both worker pool connections after the JavaScript stage deadline fires.
+
+The source-read timeout, cooperative and noncooperative abort, claimed-job
+exception, delayed retry timestamp, concurrent worker, stale recovery, and
+published-sibling paths pass local integration tests with fake providers. The
+full database suite passed 584 tests across 47 files on a temporary local
+Postgres 18 database. After reinstalling the exact lockfile dependencies, all
+1,353 unit tests passed across 151 files. Lint, Prisma validation/generation,
+the Next.js build, and the AWS worker package build passed. The earlier local
+unit failures came from stale `node_modules` versions, not the checked-in
+lockfile. PR #169 is open from `a/activation-timeout-latency` for review.
+A production worker deployment,
+small distinct staging canary, queue-lag observation, and provider-backed
+exercise audit remain unverified. Automatic retries still depend on the
+30-to-120-second item backoff and the five-minute maintenance cadence when no
+other continuation arrives. This branch does not promise a shorter live retry
+than those bounds.

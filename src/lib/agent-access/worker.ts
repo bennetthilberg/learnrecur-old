@@ -198,7 +198,7 @@ export async function runAgentSkillOperationJob(
       dependencies,
     });
     if (shouldReconcile) {
-      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now });
+      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now: new Date() });
       await queueAgentOperationContinuation(operation.id, input.userId, clock(), deadlineAt);
     }
     return { status: "processed" as const, operationId: operation.id };
@@ -319,15 +319,15 @@ export async function runAgentSkillOperationJob(
     }
   }
 
-  await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now });
+  await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now: new Date() });
   await queueAgentOperationContinuation(operation.id, input.userId, clock(), deadlineAt);
   return { status: "processed" as const, operationId: operation.id };
   } catch (error) {
     for (const [itemId, claimToken] of claims) {
-      await releaseClaimForRetry({ itemId, userId: input.userId, now, claimToken });
+      await releaseClaimForRetry({ itemId, userId: input.userId, now: new Date(), claimToken });
     }
     if (error instanceof JobContinuationLimitError) {
-      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now });
+      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now: new Date() });
       throw error;
     }
     if (isRecoverableWorkerTimeout(error)) {
@@ -363,13 +363,13 @@ export async function runAgentSkillOperationJob(
           now: clock(),
         });
       }
-      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now });
+      await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now: new Date() });
       if (!isContinuationPublishFailure(error)) {
         await queueAgentOperationContinuation(operation.id, input.userId, clock(), deadlineAt);
       }
       return { status: "retry-scheduled" as const, operationId: operation.id };
     }
-    await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now });
+    await reconcileAgentOperation({ operationId: operation.id, userId: input.userId, now: new Date() });
     throw new AgentSkillWorkerError(
       error instanceof Error ? error.message : "Agent skill processing failed.",
       true,
@@ -1299,7 +1299,7 @@ async function activateCreatedDraft(
     return;
   }
   if (draft.status === SkillStatus.ACTIVE || draft.status === SkillStatus.PAUSED) {
-    await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now, claimToken });
+    await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now: new Date(), claimToken });
     return;
   }
   if (draft.status !== SkillStatus.DRAFT) {
@@ -1443,7 +1443,7 @@ async function activateCreatedDraft(
       stage: "agent candidate verification",
     });
     if (verification.status === "not-verified" && verification.retryable) {
-      await releaseClaimForRetry({ itemId, userId, claimToken, now });
+      await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
       return;
     }
     if (verification.status === "verified") {
@@ -1497,17 +1497,47 @@ async function activateCreatedDraft(
     now,
     status: AgentOperationItemStatus.VERIFYING,
   });
-  const result = await (context.dependencies.activateDraft ?? activateSkillDraft)({
-    ...context.dependencies.activationOptions,
-    userId,
-    skillId,
-    now,
-    deadlineAt: context.deadlineAt,
-    skipUsageLimitCheck: true,
-    verifiedAgentCandidateItemId: itemId,
-    expectedDraftFingerprint: operationItem?.candidateFingerprint ?? undefined,
-    expectedDuplicateLibraryFingerprint: duplicateResult.duplicateLibraryFingerprint ?? undefined,
-  });
+  let generationJobId: string | undefined;
+  let result: Awaited<ReturnType<typeof activateSkillDraft>>;
+  try {
+    result = await (context.dependencies.activateDraft ?? activateSkillDraft)({
+      ...context.dependencies.activationOptions,
+      userId,
+      skillId,
+      now,
+      eventNow: () => new Date(),
+      onGenerationJobClaimed: (id) => { generationJobId = id; },
+      deadlineAt: context.deadlineAt,
+      skipUsageLimitCheck: true,
+      verifiedAgentCandidateItemId: itemId,
+      expectedDraftFingerprint: operationItem?.candidateFingerprint ?? undefined,
+      expectedDuplicateLibraryFingerprint: duplicateResult.duplicateLibraryFingerprint ?? undefined,
+    });
+  } catch (error) {
+    if (generationJobId) {
+      try {
+        await failClaimedActivationJob({
+          itemId,
+          userId,
+          skillId,
+          claimToken,
+          generationJobId,
+          now: new Date(),
+          timedOut: isJobStageTimeoutError(error),
+        });
+      } catch {
+        console.warn(JSON.stringify({
+          component: "agent-activation",
+          operationItemId: itemId,
+          skillId,
+          generationJobId,
+          stage: "failure-recording",
+          outcome: "failed",
+        }));
+      }
+    }
+    throw error;
+  }
   if (result.status !== "activated") {
     if (result.reason === "activation-superseded") {
       const currentSkill = await prisma.skill.findFirst({
@@ -1515,7 +1545,7 @@ async function activateCreatedDraft(
         select: { status: true },
       });
       if (currentSkill?.status === SkillStatus.ACTIVE || currentSkill?.status === SkillStatus.PAUSED) {
-        await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now, claimToken });
+        await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now: new Date(), claimToken });
         return;
       }
       const runningActivation = await prisma.generationJob.findFirst({
@@ -1528,7 +1558,7 @@ async function activateCreatedDraft(
         select: { id: true },
       });
       if (!runningActivation) {
-        await releaseClaimForRetry({ itemId, userId, claimToken, now });
+        await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
         return;
       }
     }
@@ -1537,13 +1567,72 @@ async function activateCreatedDraft(
       return;
     }
     if ("retryable" in result && result.retryable) {
-      await releaseClaimForRetry({ itemId, userId, claimToken, now });
+      await releaseClaimForRetry({ itemId, userId, claimToken, now: new Date() });
       return;
     }
     await failItem(itemId, userId, result.reason, now, claimToken);
     return;
   }
-  await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now, claimToken });
+  await finalizeAlreadyActivatedItem({ itemId, userId, skillId, now: new Date(), claimToken });
+}
+
+async function failClaimedActivationJob(input: {
+  itemId: string;
+  userId: string;
+  skillId: string;
+  claimToken: string;
+  generationJobId: string;
+  now: Date;
+  timedOut: boolean;
+}) {
+  const prisma = getPrisma();
+  const failed = await prisma.$transaction(async (tx) => {
+    const item = await tx.agentSkillOperationItem.findFirst({
+      where: {
+        id: input.itemId,
+        userId: input.userId,
+        createdSkillId: input.skillId,
+        workerClaimToken: input.claimToken,
+        status: { in: [...CLAIMED_ITEM_STATUSES] },
+      },
+      select: { id: true },
+    });
+    if (!item) return false;
+    const draft = await tx.skill.findFirst({
+      where: { id: input.skillId, userId: input.userId, status: SkillStatus.DRAFT },
+      select: { id: true },
+    });
+    if (!draft) return false;
+    const updated = await tx.generationJob.updateMany({
+      where: {
+        id: input.generationJobId,
+        userId: input.userId,
+        skillId: input.skillId,
+        kind: GenerationJobKind.SKILL_ACTIVATION,
+        status: GenerationJobStatus.RUNNING,
+      },
+      data: {
+        status: GenerationJobStatus.FAILED,
+        stage: "FAILED",
+        checkpoint: "worker-exception",
+        failureCategory: input.timedOut ? "TIMEOUT" : "UNKNOWN",
+        errorMessage: input.timedOut
+          ? "The activation stage exceeded its deadline. The attempt will be retried."
+          : "The activation worker stopped unexpectedly. The attempt will be retried.",
+        completedAt: input.now,
+      },
+    });
+    return updated.count === 1;
+  }, { maxWait: 5_000, timeout: 15_000 });
+  console.info(JSON.stringify({
+    component: "agent-activation",
+    operationItemId: input.itemId,
+    skillId: input.skillId,
+    generationJobId: input.generationJobId,
+    stage: "failure-recording",
+    outcome: failed ? "recorded" : "superseded",
+    cause: input.timedOut ? "stage-timeout" : "worker-exception",
+  }));
 }
 
 async function finalizeAlreadyActivatedItem(input: {
@@ -1612,7 +1701,10 @@ async function queueAgentOperationContinuation(
       stage: "agent continuation publish",
     });
   } catch (error) {
-    if (isJobStageTimeoutError(error)) return false;
+    if (isJobStageTimeoutError(error)) {
+      console.info(JSON.stringify({ component: "agent-activation", operationId, stage: "continuation", outcome: "deferred-no-time" }));
+      return false;
+    }
     throw error;
   }
   const prisma = getPrisma();
@@ -1655,9 +1747,11 @@ async function queueAgentOperationContinuation(
       message: "Agent continuation publication timed out.",
       stage: "agent continuation publish",
     });
+    console.info(JSON.stringify({ component: "agent-activation", operationId, stage: "continuation", outcome: "published", queuedItemCount: eligible.length }));
     return true;
   } catch (error) {
     if (isJobStageTimeoutError(error) || isContinuationPublishFailure(error)) {
+      console.warn(JSON.stringify({ component: "agent-activation", operationId, stage: "continuation", outcome: "publish-failed", cause: isJobStageTimeoutError(error) ? "stage-timeout" : "publish-error" }));
       throw new AgentSkillWorkerError("AGENT_CONTINUATION_PUBLISH_FAILED", true);
     }
     throw error;

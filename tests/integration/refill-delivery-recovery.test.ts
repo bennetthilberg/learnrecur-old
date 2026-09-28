@@ -392,4 +392,17 @@ describeDatabase("refill delivery recovery", () => {
       checkpoint: "event-pending",
     });
   });
+
+  it("preserves other diagnostics while retrying a publication", async () => {
+    const fixture = await createPendingJob("retained-diagnostics");
+    await prisma.generationJob.update({ where: { id: fixture.generationJob.id }, data: { stageMetrics: { ...(fixture.generationJob.stageMetrics as Prisma.JsonObject), retainedDiagnostic: true }, updatedAt: staleUpdatedAt } });
+    await recoverPendingRefillEvents({ now, sender: senderFor(() => { throw new Error("temporary transport failure"); }) });
+    expect((await prisma.generationJob.findUniqueOrThrow({ where: { id: fixture.generationJob.id } })).stageMetrics).toMatchObject({ retainedDiagnostic: true, refillDelivery: { attempt: 1 } });
+  });
+
+  it("rejects a stored event whose family does not match its generation job", async () => {
+    const fixture = await createPendingJob("mismatched-family", { stageMetrics: { refillDelivery: { kind: "math", targetReadyCount: 1, requestedAt: staleUpdatedAt.toISOString(), attempt: 0, nextAttemptAt: staleUpdatedAt.toISOString() } } });
+    await recoverPendingRefillEvents({ now, sender: senderFor(() => { throw new Error("must not send"); }) });
+    expect(await prisma.generationJob.findUniqueOrThrow({ where: { id: fixture.generationJob.id } })).toMatchObject({ status: "FAILED", checkpoint: "event-send-failed" });
+  });
 });

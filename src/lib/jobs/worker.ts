@@ -8,7 +8,8 @@ import {
   type JobEnvelope,
   type JobEnvironment,
 } from "./contracts";
-import { getJobSoftDeadlineMs } from "./timing";
+import { CLAIMED_JOB_VISIBILITY_SECONDS, getJobSoftDeadlineMs } from "./timing";
+import { getSafeJobErrorDetails } from "./errors";
 
 export type JobFailureCode =
   | "JOB_INVALID_MESSAGE"
@@ -35,6 +36,9 @@ const MAINTENANCE_LOG_FIELDS = [
   "refillEventsAttempted",
   "refillEventsDelivered",
   "refillEventsFailed",
+  "materialPublicationsAttempted",
+  "materialPublicationsDelivered",
+  "materialPublicationsFailed",
   "activationItemsScanned",
   "activationItemsRequeued",
   "activationItemsFinalized",
@@ -44,7 +48,7 @@ const MAINTENANCE_LOG_FIELDS = [
   "activationContinuationPublishFailures",
 ] as const;
 
-type MaintenanceLogFields = { [Field in typeof MAINTENANCE_LOG_FIELDS[number]]: number };
+type MaintenanceLogFields = { [Field in typeof MAINTENANCE_LOG_FIELDS[number]]?: number };
 
 function maintenanceLogFields(value: unknown): MaintenanceLogFields | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -52,6 +56,7 @@ function maintenanceLogFields(value: unknown): MaintenanceLogFields | undefined 
   const summary = value as Record<string, unknown>;
   for (const field of MAINTENANCE_LOG_FIELDS) {
     const count = summary[field];
+    if (field.startsWith("materialPublications") && count === undefined) continue;
     if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) return undefined;
     result[field] = count;
   }
@@ -66,48 +71,17 @@ type JobWorkerLogEvent = {
   durationMs?: number;
   phase?: DeliveryPhase;
   errorCode?: string;
+  causeCode?: string;
   sqlState?: string;
+  providerStatus?: number;
+  failureStage?: string;
 } & Partial<MaintenanceLogFields>;
 
 type DeliveryPhase =
   | "received" | "source" | "parse" | "dead-letter-invalid" | "claim"
-  | "retry-busy" | "dead-letter-claimed" | "execute" | "fail"
-  | "dead-letter-terminal" | "retry-execution" | "complete";
+  | "retry-busy" | "dead-letter-claimed" | "visibility" | "execute" | "fail"
+  | "finalize" | "dead-letter-terminal" | "retry-execution" | "complete";
 type DeliveryDiagnostic = { job?: JobEnvelope; phase: DeliveryPhase };
-
-function safeErrorCode(error: unknown): string | undefined {
-  if (error instanceof Error && [
-    "timeout exceeded when trying to connect",
-    "Connection terminated due to connection timeout",
-  ].includes(error.message)) {
-    return "DB_CONNECTION_TIMEOUT";
-  }
-  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
-  const code = error.code;
-  return typeof code === "string" &&
-    (/^P\d{4}$/.test(code) || /^(?:08|22|23|40|42|53|55|57|58|XX)[0-9A-Z]{3}$/.test(code) ||
-      ["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN"].includes(code))
-    ? code : undefined;
-}
-
-function safeSqlState(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null || !("code" in error) || error.code !== "P2010" ||
-      !("meta" in error) || typeof error.meta !== "object" || error.meta === null) return undefined;
-  const meta = error.meta as Record<string, unknown>;
-  const adapter = meta.driverAdapterError;
-  const cause = typeof adapter === "object" && adapter !== null && "cause" in adapter
-    ? adapter.cause : undefined;
-  let nested: unknown;
-  if (typeof cause === "object" && cause !== null) {
-    nested = "originalCode" in cause ? cause.originalCode : "code" in cause ? cause.code : undefined;
-  }
-  for (const value of [meta.code, nested]) {
-    if (typeof value === "string" && /^(?:08|22|23|25|40|42|53|55|57|58|XX)[0-9A-Z]{3}$/.test(value)) {
-      return value;
-    }
-  }
-  return undefined;
-}
 
 export type JobWorkerDependencies = {
   environment: JobEnvironment;
@@ -117,6 +91,7 @@ export type JobWorkerDependencies = {
   fail(job: JobEnvelope, token: string, reason: JobFailureCode, terminal: boolean): Promise<unknown>;
   execute(job: JobEnvelope, context: JobExecutionContext): Promise<unknown>;
   deadLetter(record: SQSRecord, reason: JobFailureCode): Promise<unknown>;
+  finalize(job: JobEnvelope, reason: JobFailureCode): Promise<unknown>;
   retry(record: SQSRecord, delaySeconds: number): Promise<unknown>;
   log(event: JobWorkerLogEvent): void;
   now(): Date;
@@ -173,12 +148,16 @@ export function createJobWorker(dependencies: JobWorkerDependencies) {
       return false;
     }
     if (claim.status === "dead-letter") {
+      diagnostic.phase = "finalize";
+      await dependencies.finalize(job, claim.reason);
       diagnostic.phase = "dead-letter-claimed";
       await dependencies.deadLetter(record, claim.reason);
       log({ outcome: claim.reason, name: job.name, id: job.id });
       return true;
     }
 
+    diagnostic.phase = "visibility";
+    await dependencies.retry(record, CLAIMED_JOB_VISIBILITY_SECONDS);
     const maxAttempts = getJobDefinition(job.name).maxAttempts;
     const startedAt = dependencies.now().getTime();
     let executionResult: unknown;
@@ -198,13 +177,15 @@ export function createJobWorker(dependencies: JobWorkerDependencies) {
       diagnostic.phase = "fail";
       await dependencies.fail(job, claim.token, reason, terminal);
       if (terminal) {
+        diagnostic.phase = "finalize";
+        await dependencies.finalize(job, reason);
         diagnostic.phase = "dead-letter-terminal";
         await dependencies.deadLetter(record, reason);
       } else {
         diagnostic.phase = "retry-execution";
         await dependencies.retry(record, retryDelaySeconds(claim.attempt));
       }
-      log({ outcome: reason, name: job.name, id: job.id, attempt: claim.attempt });
+      log({ outcome: reason, name: job.name, id: job.id, attempt: claim.attempt, phase: "execute", ...getSafeJobErrorDetails(error) });
       return terminal;
     }
 
@@ -236,8 +217,9 @@ export function createJobWorker(dependencies: JobWorkerDependencies) {
           name: diagnostic.job?.name,
           id: diagnostic.job?.id,
           phase: diagnostic.phase,
-          errorCode: safeErrorCode(error),
-          sqlState: safeSqlState(error),
+          errorCode: undefined,
+          sqlState: undefined,
+          ...getSafeJobErrorDetails(error),
         });
         // A transient store or transport failure must not hide this FIFO lane
         // for the queue's one-hour visibility window. Native redrive remains

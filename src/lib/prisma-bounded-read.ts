@@ -4,6 +4,7 @@ import type { Prisma } from "@/generated/prisma/client";
 import { getPrisma } from "@/lib/prisma";
 
 export class BoundedActivationReadError extends Error {
+  readonly retryable = true;
   constructor(cause: unknown) {
     super("Activation evidence could not be read from the database.", { cause });
     this.name = "BoundedActivationReadError";

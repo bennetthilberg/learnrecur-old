@@ -15,9 +15,11 @@ export async function createRuntimeWorker() {
   const transport = createJobTransport(config);
   // Delay domain imports until the SSM environment has been loaded.
   const { executeJob } = await import("./dispatch");
+  const { finalizeFailedJob } = await import("./recovery");
   return createJobWorker({
     ...config, ...delivery, ...transport,
     now: () => new Date(),
+    finalize: finalizeFailedJob,
     async execute(job, context) {
       const result = await executeJob(job, context);
       if (job.name === "learnrecur/agent-access.maintenance") await delivery.purgeExpired();

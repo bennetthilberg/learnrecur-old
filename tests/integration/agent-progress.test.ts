@@ -483,6 +483,8 @@ suite("agent progress read model", () => {
         kind: GenerationJobKind.CHOICE_EXERCISE_GENERATION,
         status: GenerationJobStatus.PENDING,
         stage: GenerationJobStage.QUEUED,
+        checkpoint: "event-pending",
+        stageMetrics: { refillDelivery: { kind: "choice", targetReadyCount: 5, requestedAt: now.toISOString(), attempt: 0, nextAttemptAt: now.toISOString() } },
         provider: "test",
         model: "fixture",
         promptVersion: "fixture-v1",

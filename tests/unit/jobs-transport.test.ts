@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SQSRecord } from "aws-lambda";
 const send = vi.hoisted(() => vi.fn());
 vi.mock("@aws-sdk/client-sqs", () => ({
@@ -14,7 +14,17 @@ const config = getJobsConfig({ AWS_REGION: "us-east-1", JOBS_ENVIRONMENT: "stagi
 const record = { messageId: "message-a", receiptHandle: "receipt-a", body: "invalid JSON", attributes: { MessageGroupId: "a".repeat(64) } } as SQSRecord;
 
 describe("SQS transport", () => {
-  beforeEach(() => send.mockReset());
+  beforeEach(() => { send.mockReset(); });
+  afterEach(() => vi.useRealTimers());
+  it("aborts a stuck visibility change instead of consuming the invocation", async () => {
+    vi.useFakeTimers();
+    send.mockImplementation(() => new Promise(() => {}));
+    const work = createJobTransport(config).retry(record, 720);
+    const rejected = expect(work).rejects.toMatchObject({ stage: "job-visibility", retryable: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await rejected;
+    expect(send.mock.calls[0][1].abortSignal.aborted).toBe(true);
+  });
   it("persists the original message and safe failure category in the matching DLQ", async () => {
     send.mockResolvedValue({ MessageId: "dead-letter-a" });
     await createJobTransport(config).deadLetter(record, "JOB_INVALID_MESSAGE");

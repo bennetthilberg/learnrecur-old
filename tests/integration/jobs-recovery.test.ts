@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import { buildJobEnvelope } from "@/lib/jobs/contracts";
-import { recoverInterruptedJob } from "@/lib/jobs/recovery";
+import { finalizeFailedJob, recoverInterruptedJob } from "@/lib/jobs/recovery";
 import { getPrisma } from "@/lib/prisma";
 import { createSkillFixture } from "./test-helpers";
 
@@ -61,5 +61,21 @@ describeDatabase("interrupted AWS domain work", () => {
     await prisma.sourceFile.update({ where: { id: source.id }, data: { status: "PROCESSING" } });
     await expect(recoverInterruptedJob(job)).rejects.toMatchObject({ message: "JOB_SOURCE_RECOVERY_CONFLICT", retryable: false });
     expect(await prisma.sourceFile.findUniqueOrThrow({ where: { id: source.id } })).toMatchObject({ status: "PROCESSING" });
+  });
+
+  it("finalizes refills after the last killed delivery and preserves semantic outcomes", async () => {
+    const owner = await user();
+    const skill = await createSkillFixture(prisma, { userId: owner.id, title: "Terminal fixture" });
+    const generation = await prisma.generationJob.create({ data: { userId: owner.id, skillId: skill.id, kind: "CHOICE_EXERCISE_GENERATION", status: "RUNNING", stage: "GENERATING", provider: "test", model: "fixture", promptVersion: "test", requestedCount: 1, attemptCount: 3 } });
+    const job = buildJobEnvelope("learnrecur/choice-refill.requested", { userId: owner.id, skillId: skill.id, generationJobId: generation.id, targetReadyCount: 1, requestedAt: new Date().toISOString() }, "staging");
+    await finalizeFailedJob(job, "JOB_ID_CONFLICT");
+    expect((await prisma.generationJob.findUniqueOrThrow({ where: { id: generation.id } })).status).toBe("RUNNING");
+    await finalizeFailedJob(job, "JOB_RETRIES_EXHAUSTED");
+    expect(await prisma.generationJob.findUniqueOrThrow({ where: { id: generation.id } })).toMatchObject({ status: "FAILED", checkpoint: "retry-exhausted" });
+    for (const status of ["SUCCEEDED", "FAILED"] as const) {
+      await prisma.generationJob.update({ where: { id: generation.id }, data: { status, checkpoint: "semantic-outcome", failureCategory: "SEMANTIC", errorMessage: "Retained diagnostic" } });
+      await finalizeFailedJob(job, "JOB_RETRIES_EXHAUSTED");
+      expect(await prisma.generationJob.findUniqueOrThrow({ where: { id: generation.id } })).toMatchObject({ status, checkpoint: "semantic-outcome", errorMessage: "Retained diagnostic" });
+    }
   });
 });

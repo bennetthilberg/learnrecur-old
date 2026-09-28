@@ -6,6 +6,7 @@ import {
   buildMetaMuseDataUrl,
   runMetaMuseJsonResponse,
 } from "@/lib/meta-muse";
+import { getSafeJobErrorDetails, isTransientJobError } from "@/lib/jobs/errors";
 import {
   resolveMetaMuseFallbackConfig,
   resolveOptionalMetaMuseFallbackConfig,
@@ -14,6 +15,16 @@ import {
 const originalEnv = process.env;
 
 describe("Meta Muse Responses client", () => {
+  it.each([401, 429, 503])("preserves HTTP %i for durable retries after fallback exhaustion", async (status) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: { type: "provider_error", message: "private provider body" } }), { status })));
+    let failure: unknown;
+    try {
+      await runMetaMuseJsonResponse({ apiKey: "fixture", baseUrl: DEFAULT_META_MUSE_BASE_URL, model: DEFAULT_META_MUSE_MODEL, operation: "refill", instructions: "Return JSON.", userContent: "Fixture." });
+    } catch (error) { failure = error; }
+    expect(isTransientJobError(failure)).toBe(status !== 401);
+    expect(getSafeJobErrorDetails(failure)).toEqual({ providerStatus: status });
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private provider body");
+  });
   beforeEach(() => {
     vi.spyOn(console, "info").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -246,6 +257,7 @@ describe("Meta Muse Responses client", () => {
     );
     await vi.advanceTimersByTimeAsync(25);
     await expectation;
+    await expect(result).rejects.toMatchObject({ retryable: true });
   });
 
   it("builds data URLs for image and PDF inputs", () => {

@@ -9,6 +9,7 @@ vi.mock("@/lib/jobs/delivery-store", () => ({ createJobDeliveryStore: () => ({ p
 vi.mock("@/lib/jobs/transport", () => ({ createJobTransport: () => ({}) }));
 vi.mock("@/lib/jobs/worker", () => ({ createJobWorker: () => mocks.run }));
 vi.mock("@/lib/jobs/dispatch", () => ({ executeJob: mocks.execute }));
+vi.mock("@/lib/jobs/recovery", () => ({ finalizeFailedJob: vi.fn() }));
 
 const event = { Records: [] } as SQSEvent;
 const context = () => ({ callbackWaitsForEmptyEventLoop: true } as Context);

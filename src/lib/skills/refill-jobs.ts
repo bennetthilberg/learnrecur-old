@@ -1,6 +1,7 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 
 import {
   GenerationAuditDecision,
@@ -18,6 +19,7 @@ import {
   awsExerciseRefillEventSender,
   type ExerciseRefillEventPayload,
   type ExerciseRefillEventSender,
+  type JobPublicationOptions,
 } from "@/lib/jobs/events";
 import { getPrisma } from "@/lib/prisma";
 import {
@@ -25,6 +27,12 @@ import {
   startOfUtcDay,
 } from "@/lib/usage-limits";
 import { REFILL_DEFERRED_CHECKPOINT } from "@/lib/import-limits";
+import { getSafeJobErrorDetails, RetryableRefillError } from "@/lib/jobs/errors";
+import { withAbortableTimeout } from "@/lib/jobs/deadline";
+import { JobContinuationLimitError } from "@/lib/jobs/publication-context";
+import type { RefillRuntimeInput } from "./refill-runtime";
+import { REFILL_JOB_RETRY_LIMIT } from "./refill-policy";
+import { withBoundedActivationRead } from "@/lib/prisma-bounded-read";
 
 import {
   DEFAULT_READY_EXACT_INPUT_TARGET,
@@ -116,21 +124,21 @@ type QueueExerciseRefillInput = {
   deferEvent?: boolean;
 };
 
-type RunChoiceExerciseRefillJobInput = ExerciseRefillEventPayload & {
+type RunChoiceExerciseRefillJobInput = ExerciseRefillEventPayload & RefillRuntimeInput & {
   now?: Date;
   generateChoiceExercises?: ChoiceExerciseGenerator;
   verifyChoiceExercises?: ChoiceExerciseVerifier;
   model?: string;
 };
 
-type RunExactInputExerciseRefillJobInput = ExerciseRefillEventPayload & {
+type RunExactInputExerciseRefillJobInput = ExerciseRefillEventPayload & RefillRuntimeInput & {
   now?: Date;
   generateExactInputExercises?: ExactInputExerciseGenerator;
   verifyExactInputExercises?: ExactInputExerciseVerifier;
   model?: string;
 };
 
-type RunMathExerciseRefillJobInput = ExerciseRefillEventPayload & {
+type RunMathExerciseRefillJobInput = ExerciseRefillEventPayload & RefillRuntimeInput & {
   now?: Date;
   generateMathExercises?: MathExerciseGenerator;
   verifyMathExercises?: MathExerciseVerifier;
@@ -160,7 +168,7 @@ type PersistedRefillDelivery = {
   requestedAt: string;
   attempt: number;
   nextAttemptAt: string;
-  leaseId?: string;
+  leaseId?: string | null;
 };
 
 export async function queueChoiceExerciseRefillForSkill(
@@ -226,7 +234,6 @@ export async function queueChoiceExerciseRefillForSkill(
     requestedCount: targetReadyCount - inventory.readyExerciseCount,
     readyExerciseCount: inventory.readyExerciseCount,
     targetReadyCount,
-    sendEvent: (sender, payload) => sender.sendChoiceRefillRequested(payload),
     eventKind: "choice",
   });
 }
@@ -304,7 +311,6 @@ export async function queueExactInputExerciseRefillForSkill(
     requestedCount: targetReadyCount - inventory.readyExerciseCount,
     readyExerciseCount: inventory.readyExerciseCount,
     targetReadyCount,
-    sendEvent: (sender, payload) => sender.sendExactInputRefillRequested(payload),
     eventKind: "exact-input",
   });
 }
@@ -382,7 +388,6 @@ export async function queueMathExerciseRefillForSkill(
     requestedCount: targetReadyCount - inventory.readyExerciseCount,
     readyExerciseCount: inventory.readyExerciseCount,
     targetReadyCount,
-    sendEvent: (sender, payload) => sender.sendMathRefillRequested(payload),
     eventKind: "math",
   });
 }
@@ -390,46 +395,85 @@ export async function queueMathExerciseRefillForSkill(
 export async function runChoiceExerciseRefillJob(
   input: RunChoiceExerciseRefillJobInput,
 ): Promise<SkillExerciseRefillResult> {
-  return refillChoiceExercisesForSkill({
+  const result = await refillChoiceExercisesForSkill({
     userId: input.userId,
     skillId: input.skillId,
     generationJobId: input.generationJobId,
     targetReadyCount: input.targetReadyCount,
     now: input.now ?? new Date(),
+    deadlineAt: input.deadlineAt,
+    signal: input.signal,
+    eventNow: input.eventNow,
     generateChoiceExercises: input.generateChoiceExercises,
     verifyChoiceExercises: input.verifyChoiceExercises,
     model: input.model,
   });
+  if (
+    result.status === "not-refilled" &&
+    result.retryable &&
+    result.failureCode
+  )
+    throw new RetryableRefillError(
+      result.failureCode,
+      result.generationAttempt,
+    );
+  return result;
 }
 
 export async function runExactInputExerciseRefillJob(
   input: RunExactInputExerciseRefillJobInput,
 ): Promise<ExactInputExerciseRefillResult> {
-  return refillExactInputExercisesForSkill({
+  const result = await refillExactInputExercisesForSkill({
     userId: input.userId,
     skillId: input.skillId,
     generationJobId: input.generationJobId,
     targetReadyCount: input.targetReadyCount,
     now: input.now ?? new Date(),
+    deadlineAt: input.deadlineAt,
+    signal: input.signal,
+    eventNow: input.eventNow,
     generateExactInputExercises: input.generateExactInputExercises,
     verifyExactInputExercises: input.verifyExactInputExercises,
     model: input.model,
   });
+  if (
+    result.status === "not-refilled" &&
+    result.retryable &&
+    result.failureCode
+  )
+    throw new RetryableRefillError(
+      result.failureCode,
+      result.generationAttempt,
+    );
+  return result;
 }
 
 export async function runMathExerciseRefillJob(
   input: RunMathExerciseRefillJobInput,
 ): Promise<MathExerciseRefillResult> {
-  return refillMathExercisesForSkill({
+  const result = await refillMathExercisesForSkill({
     userId: input.userId,
     skillId: input.skillId,
     generationJobId: input.generationJobId,
     targetReadyCount: input.targetReadyCount,
     now: input.now ?? new Date(),
+    deadlineAt: input.deadlineAt,
+    signal: input.signal,
+    eventNow: input.eventNow,
     generateMathExercises: input.generateMathExercises,
     verifyMathExercises: input.verifyMathExercises,
     model: input.model,
   });
+  if (
+    result.status === "not-refilled" &&
+    result.retryable &&
+    result.failureCode
+  )
+    throw new RetryableRefillError(
+      result.failureCode,
+      result.generationAttempt,
+    );
+  return result;
 }
 
 export async function markRefillJobRetryableFailure(input: {
@@ -438,82 +482,122 @@ export async function markRefillJobRetryableFailure(input: {
   generationJobId: string;
   now: Date;
   error: unknown;
+  terminal?: boolean;
 }): Promise<void> {
   const prisma = getPrisma();
-  await prisma.$transaction(async (tx) => {
-    const updated = await tx.generationJob.updateMany({
-      where: {
-        id: input.generationJobId,
-        userId: input.userId,
-        skillId: input.skillId,
-        status: GenerationJobStatus.RUNNING,
-      },
-      data: {
-        status: GenerationJobStatus.FAILED,
-        stage: GenerationJobStage.FAILED,
-        checkpoint: "retryable-exception",
-        failureCategory: GenerationFailureCategory.UNKNOWN,
-        errorMessage: `Unexpected refill failure: ${formatEnvError(input.error)}`,
-        completedAt: input.now,
-      },
-    });
-    if (updated.count !== 1) return;
-    const job = await tx.generationJob.findUniqueOrThrow({
-      where: { id: input.generationJobId },
-      select: {
-        id: true,
-        userId: true,
-        skillId: true,
-        idempotencyKey: true,
-        attemptCount: true,
-        retryCount: true,
-        provider: true,
-        model: true,
-        promptVersion: true,
-        releaseTuple: true,
-        contextManifest: true,
-        contextManifestHash: true,
-        degradedState: true,
-        generationReleaseId: true,
-        verifierReleaseId: true,
-        requestedCount: true,
-        acceptedCount: true,
-        rejectedCount: true,
-      },
-    });
-    await tx.generationAuditRecord.createMany({
-      data: [{
-        userId: job.userId,
-        jobId: job.id,
-        skillId: job.skillId,
-        idempotencyKey: job.idempotencyKey ?? job.id,
-        eventKey: `retryable-exception-${job.attemptCount}`,
-        stage: GenerationJobStage.FAILED,
-        checkpoint: "retryable-exception",
-        attempt: job.attemptCount,
-        retryCount: job.retryCount,
-        releaseTuple: (job.releaseTuple ?? {
-          provider: job.provider,
-          model: job.model,
-          generationPromptVersion: job.promptVersion,
-        }) as Prisma.InputJsonValue,
-        contextManifest: job.contextManifest as Prisma.InputJsonValue | undefined,
-        contextManifestHash: job.contextManifestHash,
-        stageMetrics: {
-          requestedCount: job.requestedCount,
-          acceptedCount: job.acceptedCount,
-          rejectedCount: job.rejectedCount,
-          attemptCount: job.attemptCount,
+  await prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', '5000', true)`;
+      const updated = await tx.generationJob.updateMany({
+        where: {
+          id: input.generationJobId,
+          userId: input.userId,
+          skillId: input.skillId,
+          status: {
+            in: [GenerationJobStatus.RUNNING, GenerationJobStatus.PENDING],
+          },
+          ...(input.error instanceof RetryableRefillError &&
+          input.error.expectedAttempt !== undefined
+            ? { attemptCount: input.error.expectedAttempt }
+            : {}),
         },
-        failureCategory: GenerationFailureCategory.UNKNOWN,
-        degradedState: job.degradedState,
-        decision: GenerationAuditDecision.FAILED,
-        generationReleaseId: job.generationReleaseId,
-        verifierReleaseId: job.verifierReleaseId,
-      }],
-      skipDuplicates: true,
-    });
-  });
+        data: {
+          status: GenerationJobStatus.FAILED,
+          stage: GenerationJobStage.FAILED,
+          checkpoint: input.terminal
+            ? "retry-exhausted"
+            : "retryable-exception",
+          failureCategory: GenerationFailureCategory.UNKNOWN,
+          errorMessage: `Unexpected refill failure: ${formatEnvError(input.error)}`,
+          completedAt: input.now,
+        },
+      });
+      if (updated.count !== 1) {
+        // The provider path already recorded a diagnosed, attempt-fenced
+        // failure. Preserve it; only close its retry window on exhaustion.
+        if (
+          input.terminal &&
+          input.error instanceof RetryableRefillError &&
+          input.error.expectedAttempt !== undefined
+        ) {
+          await tx.generationJob.updateMany({
+            where: {
+              id: input.generationJobId,
+              userId: input.userId,
+              skillId: input.skillId,
+              status: GenerationJobStatus.FAILED,
+              checkpoint: "retryable-exception",
+              attemptCount: input.error.expectedAttempt,
+            },
+            data: { checkpoint: "retry-exhausted", completedAt: input.now },
+          });
+        }
+        return;
+      }
+      const job = await tx.generationJob.findUniqueOrThrow({
+        where: { id: input.generationJobId },
+        select: {
+          id: true,
+          userId: true,
+          skillId: true,
+          idempotencyKey: true,
+          attemptCount: true,
+          retryCount: true,
+          provider: true,
+          model: true,
+          promptVersion: true,
+          releaseTuple: true,
+          contextManifest: true,
+          contextManifestHash: true,
+          degradedState: true,
+          generationReleaseId: true,
+          verifierReleaseId: true,
+          requestedCount: true,
+          acceptedCount: true,
+          rejectedCount: true,
+        },
+      });
+      await tx.generationAuditRecord.createMany({
+        data: [
+          {
+            userId: job.userId,
+            jobId: job.id,
+            skillId: job.skillId,
+            idempotencyKey: job.idempotencyKey ?? job.id,
+            eventKey: `retryable-exception-${job.attemptCount}`,
+            stage: GenerationJobStage.FAILED,
+            checkpoint: input.terminal
+              ? "retry-exhausted"
+              : "retryable-exception",
+            attempt: job.attemptCount,
+            retryCount: job.retryCount,
+            releaseTuple: (job.releaseTuple ?? {
+              provider: job.provider,
+              model: job.model,
+              generationPromptVersion: job.promptVersion,
+            }) as Prisma.InputJsonValue,
+            contextManifest: job.contextManifest as
+              | Prisma.InputJsonValue
+              | undefined,
+            contextManifestHash: job.contextManifestHash,
+            stageMetrics: {
+              requestedCount: job.requestedCount,
+              acceptedCount: job.acceptedCount,
+              rejectedCount: job.rejectedCount,
+              attemptCount: job.attemptCount,
+            },
+            failureCategory: GenerationFailureCategory.UNKNOWN,
+            degradedState: job.degradedState,
+            decision: GenerationAuditDecision.FAILED,
+            generationReleaseId: job.generationReleaseId,
+            verifierReleaseId: job.verifierReleaseId,
+          },
+        ],
+        skipDuplicates: true,
+      });
+    },
+    { maxWait: 2_000, timeout: 13_000 },
+  );
 }
 
 async function queueExerciseRefillJob({
@@ -523,7 +607,6 @@ async function queueExerciseRefillJob({
   requestedCount,
   readyExerciseCount,
   targetReadyCount,
-  sendEvent,
   eventKind,
 }: {
   input: QueueExerciseRefillInput;
@@ -532,10 +615,6 @@ async function queueExerciseRefillJob({
   requestedCount: number;
   readyExerciseCount: number;
   targetReadyCount: number;
-  sendEvent: (
-    sender: ExerciseRefillEventSender,
-    payload: ExerciseRefillEventPayload,
-  ) => Promise<void>;
   eventKind: DeferredExerciseRefillEvent["kind"];
 }): Promise<RefillQueueResultWithDeferredEvent> {
   const envStatus = input.sender ? null : getJobsEnvStatus();
@@ -565,7 +644,6 @@ async function queueExerciseRefillJob({
         requestedCount,
         readyExerciseCount,
         targetReadyCount,
-        sendEvent,
         eventKind,
       }),
     );
@@ -577,7 +655,6 @@ async function queueExerciseRefillJob({
   }
 
   const prisma = input.transaction;
-  const sender = input.sender ?? awsExerciseRefillEventSender;
   await prisma.$queryRaw`
     SELECT "id"
     FROM "users"
@@ -591,7 +668,9 @@ async function queueExerciseRefillJob({
   });
   if (!currentSkill) return skillNotFound();
   if (currentSkill.status !== SkillStatus.ACTIVE) {
-    return skillNotActive("Only active skills can queue more practice exercises.");
+    return skillNotActive(
+      "Only active skills can queue more practice exercises.",
+    );
   }
 
   const activeJob = await findActiveGenerationJob(
@@ -601,7 +680,10 @@ async function queueExerciseRefillJob({
     prisma,
   );
   if (activeJob) {
-    return jobInProgress(activeJob.id, "Exercise preparation has already started.");
+    return jobInProgress(
+      activeJob.id,
+      "Exercise preparation has already started.",
+    );
   }
 
   const quota = await checkExerciseRefillUsageLimit({
@@ -621,7 +703,11 @@ async function queueExerciseRefillJob({
       eventKind,
       targetReadyCount,
       now: input.now,
-      retryAt: quota.resetAt ?? new Date(startOfUtcDay(input.now).getTime() + 24 * 60 * 60 * 1_000).toISOString(),
+      retryAt:
+        quota.resetAt ??
+        new Date(
+          startOfUtcDay(input.now).getTime() + 24 * 60 * 60 * 1_000,
+        ).toISOString(),
     });
     return {
       status: "deferred",
@@ -635,51 +721,18 @@ async function queueExerciseRefillJob({
     };
   }
 
-  const createJob = () =>
-    createNewGenerationJob({
-      prisma,
-      userId: input.userId,
-      skillId: input.skillId,
-      kind,
-      promptVersion,
-      requestedCount,
-      model: input.model,
-      now: input.now,
-      eventKind,
-      targetReadyCount,
-    });
-  let generationJob: { id: string };
-
-  try {
-    generationJob = await createJob();
-  } catch (error) {
-    if (!isUniqueConstraintError(error)) {
-      throw error;
-    }
-    if (input.transaction) {
-      // A failed write aborts the PostgreSQL transaction. Do not query the
-      // transaction client after P2002; the guarded outer mutation can retry
-      // the complete claim with fresh authorization instead.
-      throw error;
-    }
-
-    const activeJob = await findActiveGenerationJob(
-      input.userId,
-      input.skillId,
-      kind,
-      prisma,
-    );
-
-    if (!activeJob) {
-      try {
-        generationJob = await createJob();
-      } catch (retryError) {
-        throw retryError;
-      }
-    } else {
-      return jobInProgress(activeJob.id, "Exercise preparation has already started.");
-    }
-  }
+  const generationJob = await createNewGenerationJob({
+    prisma,
+    userId: input.userId,
+    skillId: input.skillId,
+    kind,
+    promptVersion,
+    requestedCount,
+    model: input.model,
+    now: input.now,
+    eventKind,
+    targetReadyCount,
+  });
 
   const payload: ExerciseRefillEventPayload = {
     userId: input.userId,
@@ -692,37 +745,6 @@ async function queueExerciseRefillJob({
   // A serializable agent mutation may be retried from the beginning. Keep
   // provider delivery outside that callback so one committed job produces at
   // most one event, even when the database retries the transaction.
-  if (input.transaction || input.deferEvent) {
-    return {
-      status: "queued",
-      skillId: input.skillId,
-      generationJobId: generationJob.id,
-      requestedCount,
-      readyExerciseCount,
-      targetReadyCount,
-      message: "Exercise preparation started. Refresh in a moment to see the updated inventory.",
-      deferredEvent: { kind: eventKind, payload },
-    };
-  }
-
-  try {
-    await sendEvent(sender, payload);
-    await markRefillEventDispatched(generationJob.id);
-  } catch {
-    return markRefillEventFailure({
-      result: {
-        status: "queued",
-        skillId: input.skillId,
-        generationJobId: generationJob.id,
-        requestedCount,
-        readyExerciseCount,
-        targetReadyCount,
-        message: "Exercise preparation started. Refresh in a moment to see the updated inventory.",
-      },
-      now: input.now,
-    });
-  }
-
   return {
     status: "queued",
     skillId: input.skillId,
@@ -730,7 +752,9 @@ async function queueExerciseRefillJob({
     requestedCount,
     readyExerciseCount,
     targetReadyCount,
-    message: "Exercise preparation started. Refresh in a moment to see the updated inventory.",
+    message:
+      "Exercise preparation started. Refresh in a moment to see the updated inventory.",
+    deferredEvent: { kind: eventKind, payload },
   };
 }
 
@@ -744,114 +768,54 @@ export async function publishDeferredExerciseRefillEvent(input: {
     return withoutDeferredEvent(result);
   }
 
-  try {
-    await sendRefillEvent(sender, result.deferredEvent);
-    await markRefillEventDispatched(result.generationJobId);
-  } catch {
-    return markRefillEventFailure({ result, now: input.now });
-  }
-
-  return withoutDeferredEvent(result);
-}
-
-type QueuedRefillResult = Extract<RefillQueueResultWithDeferredEvent, { status: "queued" }>;
-
-async function markRefillEventFailure(input: {
-  result: QueuedRefillResult;
-  now: Date;
-}): Promise<RefillQueueResult> {
-  const message = "Exercise preparation could not be delivered. Retry the repair.";
-  const update = await getPrisma().generationJob.updateMany({
-    where: {
-      id: input.result.generationJobId,
-      status: GenerationJobStatus.PENDING,
-      checkpoint: {
-        in: [REFILL_EVENT_PENDING_CHECKPOINT, REFILL_EVENT_DELIVERY_CHECKPOINT],
-      },
-    },
-    data: {
-      status: GenerationJobStatus.FAILED,
-      stage: GenerationJobStage.FAILED,
-      checkpoint: "event-send-failed",
-      failureCategory: GenerationFailureCategory.TRANSPORT,
-      errorMessage: message,
-      completedAt: input.now,
-    },
+  await recoverPendingRefillEvents({
+    now: input.now,
+    sender,
+    generationJobId: result.generationJobId,
+    userId: result.deferredEvent.payload.userId,
   });
-  if (update.count === 1) {
+  const current = await withBoundedActivationRead((tx) => tx.generationJob.findFirst({
+    where: { id: result.generationJobId, userId: result.deferredEvent!.payload.userId },
+    select: { status: true, checkpoint: true },
+  }));
+  const publicResult = withoutDeferredEvent(result);
+  if (
+    !current || (current.status === GenerationJobStatus.FAILED &&
+    current.checkpoint === "event-send-failed")
+  )
     return {
       status: "not-queued",
       reason: "event-send-failed",
-      message,
-      generationJobId: input.result.generationJobId,
-      readyExerciseCount: input.result.readyExerciseCount,
-      targetReadyCount: input.result.targetReadyCount,
+      generationJobId: result.generationJobId,
+      message: "Exercise preparation could not be delivered. Retry the repair.",
     };
-  }
-
-  const current = await getPrisma().generationJob.findUnique({
-    where: { id: input.result.generationJobId },
-    select: { status: true },
-  });
-  if (!current) {
-    return {
-      status: "not-queued",
-      reason: "event-send-failed",
-      message,
-      generationJobId: input.result.generationJobId,
-      readyExerciseCount: input.result.readyExerciseCount,
-      targetReadyCount: input.result.targetReadyCount,
-    };
-  }
-
-  const publicResult = withoutDeferredEvent(input.result);
   return {
     ...publicResult,
     message:
-      current.status === GenerationJobStatus.RUNNING
-        ? "Exercise preparation is already running."
-        : current.status === GenerationJobStatus.SUCCEEDED
-          ? "Exercise preparation completed."
-          : current.status === GenerationJobStatus.FAILED
-            ? "Exercise preparation failed. Retry the repair."
-            : publicResult.message,
+      current.status === GenerationJobStatus.SUCCEEDED
+        ? "Exercise preparation completed."
+        : current.status === GenerationJobStatus.RUNNING
+          ? "Exercise preparation is already running."
+          : current.checkpoint === REFILL_EVENT_PENDING_CHECKPOINT
+        ? "Exercise preparation is saved and will be delivered automatically."
+        : publicResult.message,
   };
-}
-
-async function markRefillEventDispatched(generationJobId: string) {
-  // The event is already accepted by the provider when this update runs. If
-  // the ledger write is unavailable, leave the durable recovery marker in
-  // place; a later maintenance pass may deliver a duplicate to the
-  // generation-job idempotency guard.
-  try {
-    await getPrisma().generationJob.updateMany({
-      where: {
-        id: generationJobId,
-        status: GenerationJobStatus.PENDING,
-        checkpoint: {
-          in: [REFILL_EVENT_PENDING_CHECKPOINT, REFILL_EVENT_DELIVERY_CHECKPOINT],
-        },
-      },
-      data: { checkpoint: REFILL_EVENT_DISPATCHED_CHECKPOINT },
-    });
-  } catch {
-    // Keep event-pending recovery available after an ambiguous ledger write.
-  }
 }
 
 async function sendRefillEvent(
   sender: ExerciseRefillEventSender,
   event: DeferredExerciseRefillEvent,
+  options?: JobPublicationOptions,
 ) {
   switch (event.kind) {
     case "choice":
-      await sender.sendChoiceRefillRequested(event.payload);
+      await sender.sendChoiceRefillRequested(event.payload, options);
       return;
     case "exact-input":
-      await sender.sendExactInputRefillRequested(event.payload);
+      await sender.sendExactInputRefillRequested(event.payload, options);
       return;
     case "math":
-      await sender.sendMathRefillRequested(event.payload);
+      await sender.sendMathRefillRequested(event.payload, options);
       return;
   }
 }
@@ -865,6 +829,9 @@ async function sendRefillEvent(
 export async function recoverPendingRefillEvents(input: {
   now: Date;
   sender?: ExerciseRefillEventSender;
+  generationJobId?: string;
+  userId?: string;
+  deadlineAt?: Date;
 }): Promise<{ attempted: number; delivered: number; failed: number }> {
   if (!input.sender && getJobsEnvStatus().status === "missing-env") {
     return { attempted: 0, delivered: 0, failed: 0 };
@@ -872,45 +839,62 @@ export async function recoverPendingRefillEvents(input: {
 
   const prisma = getPrisma();
   const cutoff = new Date(input.now.getTime() - REFILL_EVENT_RECOVERY_AGE_MS);
-  const candidates = await prisma.generationJob.findMany({
-    where: {
-      kind: { in: [...REFILL_GENERATION_JOB_KINDS] },
-      status: GenerationJobStatus.PENDING,
-      user: { agentAccessDisabledAt: null },
-      checkpoint: {
-        in: [REFILL_EVENT_PENDING_CHECKPOINT, REFILL_EVENT_DELIVERY_CHECKPOINT],
+  const candidates = await withBoundedActivationRead((tx) =>
+    tx.generationJob.findMany({
+      where: {
+        ...(input.generationJobId
+          ? { id: input.generationJobId, userId: input.userId }
+          : {}),
+        kind: { in: [...REFILL_GENERATION_JOB_KINDS] },
+        status: GenerationJobStatus.PENDING,
+        user: { agentAccessDisabledAt: null },
+        checkpoint: {
+          in: [
+            REFILL_EVENT_PENDING_CHECKPOINT,
+            REFILL_EVENT_DELIVERY_CHECKPOINT,
+          ],
+        },
+        ...(input.generationJobId ? {} : { updatedAt: { lte: cutoff } }),
+        // Older refill writers did not persist a delivery payload. Keep those
+        // rows out of the bounded repair batch; malformed payloads that do have
+        // the marker are still selected and made visible by the parser below.
+        stageMetrics: {
+          path: ["refillDelivery"],
+          not: Prisma.JsonNull,
+        },
       },
-      updatedAt: { lte: cutoff },
-      // Older refill writers did not persist a delivery payload. Keep those
-      // rows out of the bounded repair batch; malformed payloads that do have
-      // the marker are still selected and made visible by the parser below.
-      stageMetrics: {
-        path: ["refillDelivery"],
-        not: Prisma.JsonNull,
+      orderBy: { updatedAt: "asc" },
+      take: REFILL_EVENT_RECOVERY_BATCH_SIZE,
+      select: {
+        id: true,
+        userId: true,
+        skillId: true,
+        kind: true,
+        checkpoint: true,
+        updatedAt: true,
+        stageMetrics: true,
       },
-    },
-    orderBy: { updatedAt: "asc" },
-    take: REFILL_EVENT_RECOVERY_BATCH_SIZE,
-    select: {
-      id: true,
-      userId: true,
-      skillId: true,
-      kind: true,
-      checkpoint: true,
-      updatedAt: true,
-      stageMetrics: true,
-    },
-  });
+    }),
+  );
 
   const sender = input.sender ?? awsExerciseRefillEventSender;
   let attempted = 0;
   let delivered = 0;
   let failed = 0;
   for (const candidate of candidates) {
+    if (input.deadlineAt && Date.now() >= input.deadlineAt.getTime() - 45_000)
+      break;
     if (await hasAccountDeletionTombstone(prisma, candidate.userId)) continue;
 
     const delivery = readPersistedRefillDelivery(candidate.stageMetrics);
-    if (!delivery) {
+    const expectedKind =
+      delivery &&
+      {
+        choice: GenerationJobKind.CHOICE_EXERCISE_GENERATION,
+        "exact-input": GenerationJobKind.EXACT_INPUT_EXERCISE_GENERATION,
+        math: GenerationJobKind.MATH_EXERCISE_GENERATION,
+      }[delivery.kind];
+    if (!delivery || expectedKind !== candidate.kind) {
       const terminal = await markUndeliverableRefillJob({
         id: candidate.id,
         checkpoint: candidate.checkpoint ?? REFILL_EVENT_PENDING_CHECKPOINT,
@@ -945,15 +929,17 @@ export async function recoverPendingRefillEvents(input: {
     });
     if (claimed !== 1) continue;
 
-    const claimedLease = await prisma.generationJob.findFirst({
-      where: {
-        id: candidate.id,
-        status: GenerationJobStatus.PENDING,
-        user: { agentAccessDisabledAt: null },
-        checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
-      },
-      select: { status: true, checkpoint: true, updatedAt: true },
-    });
+    const claimedLease = await withBoundedActivationRead((tx) =>
+      tx.generationJob.findFirst({
+        where: {
+          id: candidate.id,
+          status: GenerationJobStatus.PENDING,
+          user: { agentAccessDisabledAt: null },
+          checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
+        },
+        select: { status: true, checkpoint: true, updatedAt: true },
+      }),
+    );
     if (
       !claimedLease ||
       claimedLease.status !== GenerationJobStatus.PENDING ||
@@ -980,23 +966,44 @@ export async function recoverPendingRefillEvents(input: {
       },
     };
     try {
-      await sendRefillEvent(sender, event);
-      const updated = await prisma.generationJob.updateMany({
-        where: {
-          id: candidate.id,
-          status: GenerationJobStatus.PENDING,
-          user: { agentAccessDisabledAt: null },
-          checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
-          updatedAt: claimUpdatedAt,
-          stageMetrics: {
-            path: ["refillDelivery", "leaseId"],
-            equals: claimLeaseId,
-          },
-        },
-        data: { checkpoint: REFILL_EVENT_DISPATCHED_CHECKPOINT },
+      await withAbortableTimeout({
+        run: (signal) =>
+          sendRefillEvent(sender, event, {
+            eventId: `refill-${candidate.id}`,
+            signal,
+          }),
+        timeoutMs: 5_000,
+        stage: "refill-event-publication",
+        message: "Refill publication timed out.",
       });
+      const updated = await withBoundedActivationRead((tx) =>
+        tx.generationJob.updateMany({
+          where: {
+            id: candidate.id,
+            status: GenerationJobStatus.PENDING,
+            user: { agentAccessDisabledAt: null },
+            checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
+            updatedAt: claimUpdatedAt,
+            stageMetrics: {
+              path: ["refillDelivery", "leaseId"],
+              equals: claimLeaseId,
+            },
+          },
+          data: { checkpoint: REFILL_EVENT_DISPATCHED_CHECKPOINT },
+        }),
+      );
       if (updated.count === 1) delivered += 1;
-    } catch {
+    } catch (error) {
+      if (error instanceof JobContinuationLimitError) throw error;
+      console.warn(
+        JSON.stringify({
+          component: "refill-publication",
+          generationJobId: candidate.id,
+          attempt: nextAttempt,
+          outcome: "send-failed",
+          ...getSafeJobErrorDetails(error),
+        }),
+      );
       const where = {
         id: candidate.id,
         status: GenerationJobStatus.PENDING,
@@ -1008,31 +1015,36 @@ export async function recoverPendingRefillEvents(input: {
           equals: claimLeaseId,
         },
       };
-      const retryable = await prisma.generationJob.updateMany({
-        where,
-        data: nextAttempt >= REFILL_EVENT_MAX_DELIVERY_ATTEMPTS
-          ? {
-              status: GenerationJobStatus.FAILED,
-              stage: GenerationJobStage.FAILED,
-              checkpoint: "event-send-failed",
-              failureCategory: GenerationFailureCategory.TRANSPORT,
-              errorMessage: "Exercise preparation delivery could not be recovered. Retry the repair.",
-              completedAt: input.now,
-            }
-          : {
-              checkpoint: REFILL_EVENT_PENDING_CHECKPOINT,
-              stageMetrics: {
-                refillDelivery: {
-                  ...delivery,
-                  attempt: nextAttempt,
-                  nextAttemptAt: new Date(
-                    input.now.getTime() + REFILL_EVENT_RECOVERY_DELAY_MS,
-                  ).toISOString(),
-                  leaseId: delivery.leaseId,
+      const retryable = await withBoundedActivationRead((tx) =>
+        tx.generationJob.updateMany({
+          where,
+          data:
+            nextAttempt >= REFILL_EVENT_MAX_DELIVERY_ATTEMPTS
+              ? {
+                  status: GenerationJobStatus.FAILED,
+                  stage: GenerationJobStage.FAILED,
+                  checkpoint: "event-send-failed",
+                  failureCategory: GenerationFailureCategory.TRANSPORT,
+                  errorMessage:
+                    "Exercise preparation delivery could not be recovered. Retry the repair.",
+                  completedAt: input.now,
+                }
+              : {
+                  checkpoint: REFILL_EVENT_PENDING_CHECKPOINT,
+                  stageMetrics: {
+                    ...jsonMetrics(candidate.stageMetrics),
+                    refillDelivery: {
+                      ...delivery,
+                      attempt: nextAttempt,
+                      nextAttemptAt: new Date(
+                        input.now.getTime() + REFILL_EVENT_RECOVERY_DELAY_MS,
+                      ).toISOString(),
+                    leaseId: null,
+                    },
+                  },
                 },
-              },
-            },
-      });
+        }),
+      );
       if (retryable.count === 1) failed += 1;
     }
   }
@@ -1047,51 +1059,57 @@ async function claimRefillDelivery(input: {
     userId: string;
     checkpoint: string | null;
     updatedAt: Date;
+    stageMetrics: Prisma.JsonValue | null;
   };
   delivery: PersistedRefillDelivery;
   nextAttempt: number;
   claimLeaseId: string;
   now: Date;
 }) {
-  return input.prisma.$transaction(async (tx) => {
-    const [user] = await tx.$queryRaw<Array<{ id: string }>>`
+  return input.prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT set_config('statement_timeout', '5000', true)`;
+      const [user] = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT "id"
       FROM "users"
       WHERE "id" = ${input.candidate.userId}
       FOR UPDATE
     `;
-    if (!user) return 0;
+      if (!user) return 0;
 
-    const deletion = await tx.accountDeletionJob.findUnique({
-      where: { userId: input.candidate.userId },
-      select: { id: true },
-    });
-    if (deletion) return 0;
+      const deletion = await tx.accountDeletionJob.findUnique({
+        where: { userId: input.candidate.userId },
+        select: { id: true },
+      });
+      if (deletion) return 0;
 
-    const claimed = await tx.generationJob.updateMany({
-      where: {
-        id: input.candidate.id,
-        status: GenerationJobStatus.PENDING,
-        user: { agentAccessDisabledAt: null },
-        checkpoint: input.candidate.checkpoint,
-        updatedAt: input.candidate.updatedAt,
-      },
-      data: {
-        checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
-        stageMetrics: {
-          refillDelivery: {
-            ...input.delivery,
-            attempt: input.nextAttempt,
-            nextAttemptAt: new Date(
-              input.now.getTime() + REFILL_EVENT_RECOVERY_DELAY_MS,
-            ).toISOString(),
-            leaseId: input.claimLeaseId,
+      const claimed = await tx.generationJob.updateMany({
+        where: {
+          id: input.candidate.id,
+          status: GenerationJobStatus.PENDING,
+          user: { agentAccessDisabledAt: null },
+          checkpoint: input.candidate.checkpoint,
+          updatedAt: input.candidate.updatedAt,
+        },
+        data: {
+          checkpoint: REFILL_EVENT_DELIVERY_CHECKPOINT,
+          stageMetrics: {
+            ...jsonMetrics(input.candidate.stageMetrics),
+            refillDelivery: {
+              ...input.delivery,
+              attempt: input.nextAttempt,
+              nextAttemptAt: new Date(
+                input.now.getTime() + REFILL_EVENT_RECOVERY_DELAY_MS,
+              ).toISOString(),
+              leaseId: input.claimLeaseId,
+            },
           },
         },
-      },
-    });
-    return claimed.count;
-  });
+      });
+      return claimed.count;
+    },
+    { maxWait: 2_000, timeout: 13_000 },
+  );
 }
 
 async function hasAccountDeletionTombstone(
@@ -1105,28 +1123,39 @@ async function hasAccountDeletionTombstone(
   return Boolean(deletion);
 }
 
-function readPersistedRefillDelivery(value: Prisma.JsonValue | null): PersistedRefillDelivery | null {
+function readPersistedRefillDelivery(
+  value: Prisma.JsonValue | null,
+): PersistedRefillDelivery | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const delivery = (value as Record<string, unknown>).refillDelivery;
-  if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) return null;
+  if (!delivery || typeof delivery !== "object" || Array.isArray(delivery))
+    return null;
   const record = delivery as Record<string, unknown>;
   if (
-    (record.kind !== "choice" && record.kind !== "exact-input" && record.kind !== "math") ||
+    (record.kind !== "choice" &&
+      record.kind !== "exact-input" &&
+      record.kind !== "math") ||
     typeof record.targetReadyCount !== "number" ||
     !Number.isInteger(record.targetReadyCount) ||
     record.targetReadyCount < 1 ||
     record.targetReadyCount > 50 ||
     typeof record.requestedAt !== "string" ||
-    !Number.isFinite(Date.parse(record.requestedAt)) ||
+    !z.string().datetime().safeParse(record.requestedAt).success ||
     typeof record.attempt !== "number" ||
     !Number.isInteger(record.attempt) ||
     record.attempt < 0 ||
     typeof record.nextAttemptAt !== "string" ||
-    !Number.isFinite(Date.parse(record.nextAttemptAt))
+    !z.string().datetime().safeParse(record.nextAttemptAt).success
   ) {
     return null;
   }
   return record as unknown as PersistedRefillDelivery;
+}
+
+function jsonMetrics(value: Prisma.JsonValue | null): Prisma.JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
 }
 
 async function markUndeliverableRefillJob(input: {
@@ -1278,9 +1307,14 @@ async function findActiveGenerationJob(
       userId,
       skillId,
       kind,
-      status: {
-        in: [...ACTIVE_GENERATION_JOB_STATUSES],
-      },
+      OR: [
+        { status: { in: [...ACTIVE_GENERATION_JOB_STATUSES] } },
+        {
+          status: GenerationJobStatus.FAILED,
+          checkpoint: "retryable-exception",
+          retryCount: { lt: REFILL_JOB_RETRY_LIMIT },
+        },
+      ],
     },
     orderBy: {
       createdAt: "desc",
@@ -1339,8 +1373,4 @@ function jobInProgress(
     message,
     generationJobId,
   };
-}
-
-function isUniqueConstraintError(error: unknown): boolean {
-  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 }

@@ -23,6 +23,7 @@ import {
   runMaterialIngestionJob,
 } from "@/lib/materials/ingestion";
 import { MATERIAL_QUEUE_STALE_AFTER_MS } from "@/lib/materials/ingestion-status";
+import { publishMaterialIngestion } from "@/lib/materials/ingestion-publication";
 import { finalizeMaterialRevision } from "@/lib/materials/lifecycle";
 import { getMaterialDetail, getMaterialLibrary } from "@/lib/materials/library";
 import { MATERIAL_EMBEDDING_DIMENSIONS } from "@/lib/materials/retrieval";
@@ -168,7 +169,7 @@ describeDatabase("material ingestion", () => {
       },
     });
 
-    expect(result).toMatchObject({ status: "not-queued" });
+    expect(result).toMatchObject({ status: "queued" });
     await expect(
       prisma.materialRevision.findUniqueOrThrow({
         where: { id: prepared.materialRevisionId },
@@ -255,7 +256,7 @@ describeDatabase("material ingestion", () => {
       }),
     ).resolves.toMatchObject({
       status: MaterialRevisionStatus.QUEUED,
-      updatedAt: now,
+      updatedAt: expect.any(Date),
     });
   });
 
@@ -624,7 +625,7 @@ describeDatabase("material ingestion", () => {
     ).resolves.toEqual({ activeRevisionId: activeRevision.id });
   });
 
-  it("allows a new PDF rebuild after the previous rebuild fails to queue", async () => {
+  it("allows a new PDF rebuild after publication retries exhaust", async () => {
     const document = await PDFDocument.create();
     document.addPage([612, 792]);
     const bytes = Buffer.from(await document.save());
@@ -687,8 +688,16 @@ describeDatabase("material ingestion", () => {
           },
         },
       }),
-    ).resolves.toMatchObject({ status: "not-queued" });
+    ).resolves.toMatchObject({ status: "queued" });
 
+    const pendingRebuild = await prisma.materialRevision.findFirstOrThrow({ where: { materialId: material.id, revisionNumber: 2 } });
+    for (let attempt = 1; attempt < 5; attempt += 1) {
+      await publishMaterialIngestion({
+        userId, materialRevisionId: pendingRebuild.id,
+        now: new Date(new Date("2026-08-06T23:00:00Z").getTime() + attempt * 360_000),
+        sender: { async sendMaterialIngestionRequested() { throw new Error("synthetic queue outage"); } },
+      });
+    }
     const sentRevisionIds: string[] = [];
     const retried = await queueMaterialPdfReindex({
       userId,
@@ -780,7 +789,7 @@ describeDatabase("material ingestion", () => {
       },
     });
 
-    expect(result).toMatchObject({ status: "not-queued" });
+    expect(result).toMatchObject({ status: "queued" });
     const replacement = await prisma.materialRevision.findFirstOrThrow({
       where: { materialId: material.id, revisionNumber: 2 },
       include: { sourceFiles: true },
@@ -981,7 +990,7 @@ describeDatabase("material ingestion", () => {
       },
     });
 
-    expect(queued).toMatchObject({ status: "not-queued" });
+    expect(queued).toMatchObject({ status: "queued" });
     const revision = await prisma.materialRevision.findFirstOrThrow({
       where: { userId, sourceUrl: "https://books.example/ambiguous-book" },
       select: { status: true, errorCode: true, sourceFiles: { select: { status: true } } },
@@ -1043,7 +1052,7 @@ describeDatabase("material ingestion", () => {
       },
     });
 
-    expect(refreshed).toMatchObject({ status: "not-queued" });
+    expect(refreshed).toMatchObject({ status: "queued" });
     const revision = await prisma.materialRevision.findFirstOrThrow({
       where: { id: { not: initial.materialRevisionId }, materialId: initial.materialId },
       orderBy: { revisionNumber: "desc" },

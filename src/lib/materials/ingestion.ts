@@ -13,7 +13,6 @@ import {
 } from "@/generated/prisma/client";
 import { getJobsEnvStatus } from "@/lib/jobs/config";
 import {
-  awsMaterialIngestionEventSender,
   type MaterialIngestionEventSender,
 } from "@/lib/jobs/events";
 import {
@@ -24,6 +23,7 @@ import {
   prepareMaterialPdfInputSchema,
 } from "@/lib/materials/contracts";
 import { MATERIAL_QUEUE_STALE_AFTER_MS } from "@/lib/materials/ingestion-status";
+import { createMaterialIngestionDelivery, publishMaterialIngestion } from "@/lib/materials/ingestion-publication";
 import {
   createGeminiMaterialEmbeddingGenerator,
   type MaterialEmbeddingGenerator,
@@ -400,6 +400,7 @@ export async function queueMaterialPdfIngestion(input: {
       id: true,
       materialId: true,
       status: true,
+      processingMetadata: true,
       sourceFiles: {
         where: { kind: SourceFileKind.PDF },
         take: 1,
@@ -415,7 +416,10 @@ export async function queueMaterialPdfIngestion(input: {
   });
   const sourceFile = revision?.sourceFiles[0];
   if (!revision || !sourceFile?.storageKey || !sourceFile.storageBucket) {
-    return { status: "not-found", message: "Material PDF upload was not found." };
+    return {
+      status: "not-found",
+      message: "Material PDF upload was not found.",
+    };
   }
   if (revision.status !== MaterialRevisionStatus.PENDING_UPLOAD) {
     return {
@@ -434,67 +438,77 @@ export async function queueMaterialPdfIngestion(input: {
       key: sourceFile.storageKey,
       bucket: sourceFile.storageBucket,
     });
-    if (head.byteSize !== sourceFile.byteSize || head.mimeType?.split(";")[0] !== "application/pdf") {
+    if (
+      head.byteSize !== sourceFile.byteSize ||
+      head.mimeType?.split(";")[0] !== "application/pdf"
+    ) {
       return {
         status: "not-queued",
-        message: "The uploaded PDF did not match the prepared file. Choose it again.",
+        message:
+          "The uploaded PDF did not match the prepared file. Choose it again.",
       };
     }
   } catch {
     return {
       status: "not-queued",
-      message: "The private PDF upload could not be verified. Try uploading it again.",
+      message:
+        "The private PDF upload could not be verified. Try uploading it again.",
     };
   }
 
-  await prisma.$transaction([
-    prisma.materialRevision.update({
-      where: { id: revision.id },
-      data: { status: MaterialRevisionStatus.QUEUED, errorCode: null, errorMessage: null },
-    }),
-    prisma.sourceFile.update({
-      where: { id: sourceFile.id },
+  const queued = await prisma.$transaction(async (tx) => {
+    const changed = await tx.materialRevision.updateMany({
+      where: {
+        id: revision.id,
+        userId: input.userId,
+        status: MaterialRevisionStatus.PENDING_UPLOAD,
+        material: { status: StudyMaterialStatus.ACTIVE },
+      },
+      data: {
+        status: MaterialRevisionStatus.QUEUED,
+        errorCode: null,
+        errorMessage: null,
+        processingMetadata: {
+          ...(revision.processingMetadata &&
+          typeof revision.processingMetadata === "object" &&
+          !Array.isArray(revision.processingMetadata)
+            ? revision.processingMetadata
+            : {}),
+          ingestionDelivery: createMaterialIngestionDelivery(input.now),
+        },
+      },
+    });
+    if (changed.count !== 1) return false;
+    await tx.sourceFile.updateMany({
+      where: {
+        id: sourceFile.id,
+        userId: input.userId,
+        materialRevisionId: revision.id,
+      },
       data: { status: SourceFileStatus.UPLOADED },
-    }),
-  ]);
-
-  try {
-    await (input.eventSender ?? awsMaterialIngestionEventSender).sendMaterialIngestionRequested({
-      userId: input.userId,
+    });
+    return true;
+  });
+  if (!queued)
+    return {
+      status: "queued",
+      materialId: revision.materialId,
       materialRevisionId: revision.id,
-      requestedAt: input.now.toISOString(),
-    });
-  } catch {
-    await prisma.$transaction(async (tx) => {
-      const failedRevision = await tx.materialRevision.updateMany({
-        where: {
-          id: revision.id,
-          userId: input.userId,
-          status: MaterialRevisionStatus.QUEUED,
-        },
-        data: {
-          status: MaterialRevisionStatus.FAILED,
-          errorCode: "EVENT_SEND_FAILED",
-          errorMessage: "Background processing could not be queued.",
-        },
-      });
-      if (failedRevision.count === 1) {
-        await tx.sourceFile.updateMany({
-          where: {
-            id: sourceFile.id,
-            userId: input.userId,
-            materialRevisionId: revision.id,
-            status: SourceFileStatus.UPLOADED,
-          },
-          data: { status: SourceFileStatus.FAILED },
-        });
-      }
-    });
+      message: "Material processing has already started.",
+    };
+
+  const publication = await publishMaterialIngestion({
+    userId: input.userId,
+    materialRevisionId: revision.id,
+    now: input.now,
+    sender: input.eventSender,
+  });
+  if (publication === "terminal")
     return {
       status: "not-queued",
-      message: "Background processing could not be queued. Try again.",
+      message:
+        "Background processing could not be delivered. Retry the import.",
     };
-  }
 
   return {
     status: "queued",
@@ -510,7 +524,14 @@ export async function queueWebsiteMaterialImport(input: {
   input: unknown;
   storage?: SourceObjectStorage;
   eventSender?: MaterialIngestionEventSender;
-}): Promise<QueueMaterialIngestionResult | { status: "invalid"; message: string; fieldErrors: Record<string, string[]> }> {
+}): Promise<
+  | QueueMaterialIngestionResult
+  | {
+      status: "invalid";
+      message: string;
+      fieldErrors: Record<string, string[]>;
+    }
+> {
   const parsed = confirmWebsiteImportInputSchema.safeParse(input.input);
   if (!parsed.success) {
     return {
@@ -525,7 +546,9 @@ export async function queueWebsiteMaterialImport(input: {
     return {
       status: "invalid",
       message: "Website pages must come from the same textbook site.",
-      fieldErrors: { selectedUrls: ["Choose only pages from the discovered textbook."] },
+      fieldErrors: {
+        selectedUrls: ["Choose only pages from the discovered textbook."],
+      },
     };
   }
 
@@ -555,6 +578,9 @@ export async function queueWebsiteMaterialImport(input: {
         materialId: material.id,
         revisionNumber: 1,
         status: MaterialRevisionStatus.QUEUED,
+        processingMetadata: {
+          ingestionDelivery: createMaterialIngestionDelivery(input.now),
+        },
         sourceUrl: parsed.data.sourceUrl,
         storageBucket: storageSetup.storage.bucketName,
       },
@@ -588,49 +614,32 @@ export async function queueWebsiteMaterialImport(input: {
       where: { id: revision.id },
       data: { storageKey },
     });
-    return { materialId: material.id, materialRevisionId: revision.id, sourceFileId: sourceFile.id };
+    return {
+      materialId: material.id,
+      materialRevisionId: revision.id,
+      sourceFileId: sourceFile.id,
+    };
   });
 
-  try {
-    await (input.eventSender ?? awsMaterialIngestionEventSender).sendMaterialIngestionRequested({
-      userId: input.userId,
-      materialRevisionId: created.materialRevisionId,
-      requestedAt: input.now.toISOString(),
-    });
-  } catch {
-    await prisma.$transaction(async (tx) => {
-      const failedRevision = await tx.materialRevision.updateMany({
-        where: {
-          id: created.materialRevisionId,
-          userId: input.userId,
-          status: MaterialRevisionStatus.QUEUED,
-        },
-        data: {
-          status: MaterialRevisionStatus.FAILED,
-          errorCode: "EVENT_SEND_FAILED",
-          errorMessage: "Background processing could not be queued.",
-        },
-      });
-      if (failedRevision.count === 1) {
-        await tx.sourceFile.updateMany({
-          where: {
-            id: created.sourceFileId,
-            userId: input.userId,
-            materialRevisionId: created.materialRevisionId,
-            status: SourceFileStatus.UPLOADED,
-          },
-          data: { status: SourceFileStatus.FAILED },
-        });
-      }
-    });
-    return { status: "not-queued", message: "Background processing could not be queued. Try again." };
-  }
+  const publication = await publishMaterialIngestion({
+    userId: input.userId,
+    materialRevisionId: created.materialRevisionId,
+    now: input.now,
+    sender: input.eventSender,
+  });
+  if (publication === "terminal")
+    return {
+      status: "not-queued",
+      message:
+        "Background processing could not be delivered. Retry the import.",
+    };
 
   return {
     status: "queued",
     materialId: created.materialId,
     materialRevisionId: created.materialRevisionId,
-    message: "Website pages saved for import. LearnRecur is building the outline.",
+    message:
+      "Website pages saved for import. LearnRecur is building the outline.",
   };
 }
 
@@ -641,7 +650,9 @@ export async function retryMaterialIngestion(input: {
   eventSender?: MaterialIngestionEventSender;
 }): Promise<QueueMaterialIngestionResult> {
   const prisma = getPrisma();
-  const staleBefore = new Date(input.now.getTime() - MATERIAL_QUEUE_STALE_AFTER_MS);
+  const staleBefore = new Date(
+    input.now.getTime() - MATERIAL_QUEUE_STALE_AFTER_MS,
+  );
   const retryableStatus = {
     OR: [
       { status: MaterialRevisionStatus.FAILED },
@@ -656,13 +667,20 @@ export async function retryMaterialIngestion(input: {
       id: input.materialRevisionId,
       userId: input.userId,
       ...retryableStatus,
+      material: { status: StudyMaterialStatus.ACTIVE },
     },
-    select: { id: true, materialId: true },
+    select: {
+      id: true,
+      materialId: true,
+      updatedAt: true,
+      processingMetadata: true,
+    },
   });
   if (!revision) {
     return {
       status: "not-found",
-      message: "Material processing is already running or is not ready to retry.",
+      message:
+        "Material processing is already running or is not ready to retry.",
     };
   }
 
@@ -671,12 +689,22 @@ export async function retryMaterialIngestion(input: {
       id: revision.id,
       userId: input.userId,
       ...retryableStatus,
+      updatedAt: revision.updatedAt,
+      material: { status: StudyMaterialStatus.ACTIVE },
     },
     data: {
       status: MaterialRevisionStatus.QUEUED,
       errorCode: null,
       errorMessage: null,
       updatedAt: input.now,
+      processingMetadata: {
+        ...(revision.processingMetadata &&
+        typeof revision.processingMetadata === "object" &&
+        !Array.isArray(revision.processingMetadata)
+          ? revision.processingMetadata
+          : {}),
+        ingestionDelivery: createMaterialIngestionDelivery(input.now),
+      },
     },
   });
   if (claimed.count !== 1) {
@@ -685,28 +713,18 @@ export async function retryMaterialIngestion(input: {
       message: "Material processing already resumed before this retry.",
     };
   }
-  try {
-    await (input.eventSender ?? awsMaterialIngestionEventSender).sendMaterialIngestionRequested({
-      userId: input.userId,
-      materialRevisionId: revision.id,
-      requestedAt: input.now.toISOString(),
-    });
-  } catch {
-    await prisma.materialRevision.updateMany({
-      where: {
-        id: revision.id,
-        userId: input.userId,
-        status: MaterialRevisionStatus.QUEUED,
-        updatedAt: input.now,
-      },
-      data: {
-        status: MaterialRevisionStatus.FAILED,
-        errorCode: "EVENT_SEND_FAILED",
-        errorMessage: "Background processing could not be queued.",
-      },
-    });
-    return { status: "not-queued", message: "Background processing could not be queued. Try again." };
-  }
+  const publication = await publishMaterialIngestion({
+    userId: input.userId,
+    materialRevisionId: revision.id,
+    now: input.now,
+    sender: input.eventSender,
+  });
+  if (publication === "terminal")
+    return {
+      status: "not-queued",
+      message:
+        "Background processing could not be delivered. Retry the import.",
+    };
 
   return {
     status: "queued",
@@ -782,17 +800,26 @@ export async function queueMaterialPdfReindex(input: {
     !sourceFile.storageKey ||
     !sourceFile.mimeType
   ) {
-    return { status: "not-found", message: "Ready PDF material was not found." };
+    return {
+      status: "not-found",
+      message: "Ready PDF material was not found.",
+    };
   }
   const latestRevision = material.revisions[0];
   if (
     latestRevision?.id !== activeRevision.id &&
     latestRevision?.status !== MaterialRevisionStatus.FAILED
   ) {
-    return { status: "not-queued", message: "This material is already rebuilding." };
+    return {
+      status: "not-queued",
+      message: "This material is already rebuilding.",
+    };
   }
   if (storageSetup.storage.bucketName !== sourceFile.storageBucket) {
-    return { status: "not-queued", message: "The saved PDF storage location is unavailable." };
+    return {
+      status: "not-queued",
+      message: "The saved PDF storage location is unavailable.",
+    };
   }
 
   try {
@@ -805,10 +832,16 @@ export async function queueMaterialPdfReindex(input: {
       (expectedByteSize !== null && head.byteSize !== expectedByteSize) ||
       head.mimeType?.split(";")[0]?.trim().toLowerCase() !== "application/pdf"
     ) {
-      return { status: "not-queued", message: "The saved PDF could not be verified." };
+      return {
+        status: "not-queued",
+        message: "The saved PDF could not be verified.",
+      };
     }
   } catch {
-    return { status: "not-queued", message: "The saved PDF could not be verified." };
+    return {
+      status: "not-queued",
+      message: "The saved PDF could not be verified.",
+    };
   }
 
   const created = await prisma.$transaction(async (tx) => {
@@ -853,7 +886,10 @@ export async function queueMaterialPdfReindex(input: {
         status: MaterialRevisionStatus.QUEUED,
         storageBucket: sourceFile.storageBucket,
         storageKey: sourceFile.storageKey,
-        processingMetadata: { rebuildOfRevisionId: activeRevision.id },
+        processingMetadata: {
+          rebuildOfRevisionId: activeRevision.id,
+          ingestionDelivery: createMaterialIngestionDelivery(input.now),
+        },
       },
       select: { id: true },
     });
@@ -903,38 +939,24 @@ export async function queueMaterialPdfReindex(input: {
     };
   });
   if (created.status === "already-running") {
-    return { status: "not-queued", message: "This material is already rebuilding." };
+    return {
+      status: "not-queued",
+      message: "This material is already rebuilding.",
+    };
   }
 
-  try {
-    await (input.eventSender ?? awsMaterialIngestionEventSender).sendMaterialIngestionRequested({
-      userId: input.userId,
-      materialRevisionId: created.materialRevisionId,
-      requestedAt: input.now.toISOString(),
-    });
-  } catch {
-    await prisma.$transaction(async (tx) => {
-      const failedRevision = await tx.materialRevision.updateMany({
-        where: {
-          id: created.materialRevisionId,
-          userId: input.userId,
-          status: MaterialRevisionStatus.QUEUED,
-        },
-        data: {
-          status: MaterialRevisionStatus.FAILED,
-          errorCode: "EVENT_SEND_FAILED",
-          errorMessage: "Background processing could not be queued.",
-        },
-      });
-      if (failedRevision.count === 1) {
-        await tx.sourceFile.updateMany({
-          where: { id: created.sourceFileId, userId: input.userId },
-          data: { status: SourceFileStatus.FAILED },
-        });
-      }
-    });
-    return { status: "not-queued", message: "PDF reindex could not be queued. Try again." };
-  }
+  const publication = await publishMaterialIngestion({
+    userId: input.userId,
+    materialRevisionId: created.materialRevisionId,
+    now: input.now,
+    sender: input.eventSender,
+  });
+  if (publication === "terminal")
+    return {
+      status: "not-queued",
+      message:
+        "Background processing could not be delivered. Retry the import.",
+    };
 
   return {
     status: "queued",
@@ -961,7 +983,11 @@ export async function queueWebsiteMaterialRefresh(input: {
   }
   const prisma = getPrisma();
   const material = await prisma.studyMaterial.findFirst({
-    where: { id: input.materialId, userId: input.userId, kind: StudyMaterialKind.WEB },
+    where: {
+      id: input.materialId,
+      userId: input.userId,
+      kind: StudyMaterialKind.WEB,
+    },
     select: {
       id: true,
       collectionId: true,
@@ -980,8 +1006,15 @@ export async function queueWebsiteMaterialRefresh(input: {
   });
   const sourceUrl = material?.activeRevision?.sourceUrl;
   const metadata = material?.activeRevision?.sourceFiles[0]?.metadata;
-  if (!material || !sourceUrl || readStringArray(metadata ?? null, "selectedUrls").length === 0) {
-    return { status: "not-found", message: "Ready website material was not found." };
+  if (
+    !material ||
+    !sourceUrl ||
+    readStringArray(metadata ?? null, "selectedUrls").length === 0
+  ) {
+    return {
+      status: "not-found",
+      message: "Ready website material was not found.",
+    };
   }
   const revision = await createNextMaterialRevision({
     userId: input.userId,
@@ -997,11 +1030,14 @@ export async function queueWebsiteMaterialRefresh(input: {
     materialRevisionId: revision.id,
     fileName: "website-snapshot.json",
   });
-  const [, createdSourceFile] = await prisma.$transaction([
+  await prisma.$transaction([
     prisma.materialRevision.update({
       where: { id: revision.id },
       data: {
         status: MaterialRevisionStatus.QUEUED,
+        processingMetadata: {
+          ingestionDelivery: createMaterialIngestionDelivery(input.now),
+        },
         storageBucket: storageSetup.storage.bucketName,
         storageKey,
       },
@@ -1023,40 +1059,18 @@ export async function queueWebsiteMaterialRefresh(input: {
     }),
   ]);
 
-  try {
-    await (input.eventSender ?? awsMaterialIngestionEventSender).sendMaterialIngestionRequested({
-      userId: input.userId,
-      materialRevisionId: revision.id,
-      requestedAt: input.now.toISOString(),
-    });
-  } catch {
-    await prisma.$transaction(async (tx) => {
-      const failedRevision = await tx.materialRevision.updateMany({
-        where: {
-          id: revision.id,
-          userId: input.userId,
-          status: MaterialRevisionStatus.QUEUED,
-        },
-        data: {
-          status: MaterialRevisionStatus.FAILED,
-          errorCode: "EVENT_SEND_FAILED",
-          errorMessage: "Background processing could not be queued.",
-        },
-      });
-      if (failedRevision.count === 1) {
-        await tx.sourceFile.updateMany({
-          where: {
-            id: createdSourceFile.id,
-            userId: input.userId,
-            materialRevisionId: revision.id,
-            status: SourceFileStatus.UPLOADED,
-          },
-          data: { status: SourceFileStatus.FAILED },
-        });
-      }
-    });
-    return { status: "not-queued", message: "Website refresh could not be queued. Try again." };
-  }
+  const publication = await publishMaterialIngestion({
+    userId: input.userId,
+    materialRevisionId: revision.id,
+    now: input.now,
+    sender: input.eventSender,
+  });
+  if (publication === "terminal")
+    return {
+      status: "not-queued",
+      message:
+        "Background processing could not be delivered. Retry the import.",
+    };
 
   return {
     status: "queued",

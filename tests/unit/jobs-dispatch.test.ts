@@ -90,4 +90,26 @@ describe("all migrated job families", () => {
     expect(JSON.stringify(log.mock.calls)).not.toMatch(/provider failed|database unavailable/);
     log.mockRestore();
   });
+
+  it.each(["choice", "exact-input", "math"])("retries a returned transient %s refill failure", async (kind) => {
+    const handler = kind === "exact-input" ? handlers.exact : handlers[kind as "choice" | "math"];
+    handler.mockResolvedValue({ status: "not-refilled", reason: "generation-failed", retryable: true, failureCode: "REFILL_PROVIDER_UNAVAILABLE" });
+    await expect(executeJob(buildJobEnvelope(`learnrecur/${kind}-refill.requested`, refill, "staging"), context))
+      .rejects.toMatchObject({ retryable: true, code: "REFILL_PROVIDER_UNAVAILABLE" });
+  });
+
+  it.each(["choice", "exact-input", "math"])("acknowledges terminal %s quality rejection", async (kind) => {
+    const handler = kind === "exact-input" ? handlers.exact : handlers[kind as "choice" | "math"];
+    const result = { status: "not-refilled", reason: "invalid-verification", retryable: false };
+    handler.mockResolvedValue(result);
+    await expect(executeJob(buildJobEnvelope(`learnrecur/${kind}-refill.requested`, refill, "staging"), context)).resolves.toEqual(result);
+    expect(handlers.refillFailure).not.toHaveBeenCalled();
+  });
+
+  it.each(["choice", "exact-input", "math"])("passes the delivery deadline to %s refill work", async (kind) => {
+    const handler = kind === "exact-input" ? handlers.exact : handlers[kind as "choice" | "math"];
+    const deadlineAt = new Date("2026-09-05T02:06:00Z");
+    await executeJob(buildJobEnvelope(`learnrecur/${kind}-refill.requested`, refill, "staging"), { ...context, deadlineAt });
+    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ deadlineAt }));
+  });
 });

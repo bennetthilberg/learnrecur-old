@@ -118,6 +118,22 @@ export const clerkAppearance = {
   },
 } as const;
 
+// These overrides belong to the UserProfile opened from UserButton. Clerk
+// only applies them when they are passed through UserButton.userProfileProps.
+export const clerkUserProfileAppearance = {
+  elements: {
+    cardBox: {
+      overflow: "hidden",
+    },
+    formFieldInput__signOutOfOtherSessions: {
+      height: "18px",
+      minHeight: "18px",
+      padding: "0",
+      width: "18px",
+    },
+  },
+} as const;
+
 export const clerkLocalization = {
   signIn: {
     start: {

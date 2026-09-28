@@ -49,6 +49,15 @@ for (const viewport of [
       path: testInfo.outputPath(`account-menu-${viewport.name}.png`),
       animations: "disabled",
     });
+
+    await page.getByRole("button", { name: /manage account/i }).click();
+    const profileCard = page.locator(".cl-cardBox").last();
+    await expect(profileCard).toBeVisible();
+    await expect(profileCard).toHaveCSS("overflow", "hidden");
+    await page.screenshot({
+      path: testInfo.outputPath(`account-profile-${viewport.name}.png`),
+      animations: "disabled",
+    });
     expect(hydrationErrors).toEqual([]);
   });
 }

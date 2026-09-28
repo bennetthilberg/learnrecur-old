@@ -26,11 +26,11 @@ import {
   type AgentCompleteMaterialUploadInput,
   type AgentImportMaterialUrlInput,
 } from "@/lib/agent-access/material-ingestion-contracts";
+import type { MaterialIngestionEventSender } from "@/lib/jobs/events";
 import {
-  awsMaterialIngestionEventSender,
-  type MaterialIngestionEventSender,
-} from "@/lib/jobs/events";
-import { getJobsEnvStatus } from "@/lib/jobs/config";
+  createMaterialIngestionDelivery,
+  publishMaterialIngestion,
+} from "@/lib/materials/ingestion-publication";
 import {
   buildMaterialObjectKey,
   retryMaterialIngestion,
@@ -468,10 +468,7 @@ export async function completeAgentMaterialUpload(
     }
     if (
       verifiedHead === null ||
-      !samePreparedMaterialUploadSnapshot(
-        preparedSnapshot,
-        currentSnapshot,
-      )
+      !samePreparedMaterialUploadSnapshot(preparedSnapshot, currentSnapshot)
     ) {
       throw new AgentMaterialIngestionError(
         "stale_material_revision",
@@ -504,6 +501,14 @@ export async function completeAgentMaterialUpload(
         status: MaterialRevisionStatus.QUEUED,
         errorCode: null,
         errorMessage: null,
+        processingMetadata: {
+          ...(revision.processingMetadata &&
+          typeof revision.processingMetadata === "object" &&
+          !Array.isArray(revision.processingMetadata)
+            ? revision.processingMetadata
+            : {}),
+          ingestionDelivery: createMaterialIngestionDelivery(new Date()),
+        },
       },
     });
     if (claimed.count !== 1) {
@@ -647,6 +652,9 @@ export async function importAgentMaterialUrl(
         status: MaterialRevisionStatus.QUEUED,
         sourceUrl: discovered.sourceUrl,
         storageBucket: storage.storage.bucketName,
+        processingMetadata: {
+          ingestionDelivery: createMaterialIngestionDelivery(new Date()),
+        },
       },
       select: { id: true },
     });
@@ -1027,6 +1035,7 @@ type PreparedMaterialUploadSnapshot = {
     id: string;
     materialId: string;
     status: MaterialRevisionStatus;
+    processingMetadata?: Prisma.JsonValue | null;
   };
   sourceFile: {
     id: string;
@@ -1327,56 +1336,14 @@ async function sendMaterialIngestionEvent(input: {
   eventSender?: MaterialIngestionEventSender;
 }): Promise<MaterialOperation> {
   if (!input.operation.materialRevisionId) return input.operation;
-  const sender = input.eventSender ?? awsMaterialIngestionEventSender;
-  try {
-    if (!input.eventSender) {
-      const jobs = getJobsEnvStatus();
-      if (jobs.status === "missing-env") throw new Error(jobs.message);
-    }
-    await sender.sendMaterialIngestionRequested({
-      userId: input.auth.userId,
-      materialRevisionId: input.operation.materialRevisionId,
-      requestedAt: new Date().toISOString(),
-    });
-  } catch {
-    const failed = await getPrisma().$transaction(async (tx) => {
-      const claimedFailure = await tx.materialRevision.updateMany({
-        where: {
-          id: input.operation.materialRevisionId!,
-          userId: input.auth.userId,
-          status: MaterialRevisionStatus.QUEUED,
-        },
-        data: {
-          status: MaterialRevisionStatus.FAILED,
-          errorCode: "EVENT_SEND_FAILED",
-          errorMessage: "Background processing could not be queued.",
-        },
-      });
-      if (claimedFailure.count === 1) {
-        await tx.sourceFile.updateMany({
-          where: {
-            materialRevisionId: input.operation.materialRevisionId!,
-            userId: input.auth.userId,
-          },
-          data: { status: SourceFileStatus.FAILED },
-        });
-        await tx.agentSkillOperation.update({
-          where: { id: input.operation.id },
-          data: {
-            status: AgentOperationStatus.FAILED,
-            errorCode: "EVENT_SEND_FAILED",
-            errorMessage: "Background processing could not be queued.",
-            completedAt: new Date(),
-          },
-        });
-      }
-      return tx.agentSkillOperation.findUniqueOrThrow({
-        where: { id: input.operation.id },
-        select: MATERIAL_OPERATION_SELECT,
-      });
-    });
-    return failed;
-  }
+  // The transaction has already persisted the intent. A temporary or ambiguous
+  // send stays queued; maintenance owns bounded recovery and terminal failure.
+  await publishMaterialIngestion({
+    userId: input.auth.userId,
+    materialRevisionId: input.operation.materialRevisionId,
+    now: new Date(),
+    sender: input.eventSender,
+  });
   return getPrisma().agentSkillOperation.findUniqueOrThrow({
     where: { id: input.operation.id },
     select: MATERIAL_OPERATION_SELECT,
@@ -1570,6 +1537,7 @@ async function readPreparedMaterialUploadSnapshot(
       id: true,
       materialId: true,
       status: true,
+      processingMetadata: true,
       sourceFiles: {
         where: {
           id: sourceFileId,

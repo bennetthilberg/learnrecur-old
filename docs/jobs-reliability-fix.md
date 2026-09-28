@@ -23,7 +23,8 @@ verification and policy changes remain terminal and publish no exercises.
 
 Persist publication intent with the domain transaction for refills and every
 material ingestion entry point: PDF completion, website import, explicit retry,
-PDF reindex and website refresh. Reuse a stable envelope identity and timestamp
+PDF reindex and website refresh, including agent PDF completion and URL imports.
+Reuse a stable envelope identity and timestamp
 through transport retries. A failed send must leave recoverable intent rather
 than immediately failing the domain job. The scheduled maintenance sweep must
 claim pending publication, retry with a bounded delay, and record terminal
@@ -98,11 +99,14 @@ provider bodies, SQL, credentials or study text.
 ## Verification evidence
 
 Failure-injection tests were first observed failing, then passed after the
-corresponding changes. The complete local database gate passed **617 tests in
+corresponding changes. The complete local database gate passed **623 tests in
 49 suites** against disposable PostgreSQL 18 with pgvector and all migrations.
 It covers all three refill families, successful replay, bounded exhaustion,
 lost acknowledgements, crashes, overlapping publishers, stale attempts,
 deletion, ownership, malformed intent and unchanged learner history.
+Agent import tests cover PDF/URL publication recovery, stable identity after a
+lost acknowledgement, and operation polling after bounded send exhaustion.
+Successful choice refill retries record their actual attempt and retry count.
 
 Local lint, TypeScript, Prisma validation/generation, the web production build
 and Lambda package build passed. The unit gate passed **1,411 tests in 154 suites**.

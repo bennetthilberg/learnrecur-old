@@ -177,6 +177,16 @@ describeDatabase("refill reliability", () => {
         generationJobId: queued.generationJobId,
         exerciseCount: 1,
       });
+      if (family.kind === "choice") {
+        expect(
+          await prisma.generationAuditRecord.findFirstOrThrow({
+            where: {
+              jobId: queued.generationJobId,
+              eventKey: "publication-complete",
+            },
+          }),
+        ).toMatchObject({ attempt: 2, retryCount: 1 });
+      }
       expect(
         await prisma.generationJob.count({ where: { skillId: input.skillId } }),
       ).toBe(1);

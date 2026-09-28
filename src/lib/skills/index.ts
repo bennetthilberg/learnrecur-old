@@ -4672,7 +4672,8 @@ export async function refillChoiceExercisesForSkill(
             eventKey: "publication-complete",
             stage: GenerationJobStage.COMPLETE,
             checkpoint: "published",
-            attempt: 1,
+            attempt: generationJob.attemptCount,
+            retryCount: generationJob.retryCount,
             releaseTuple: generationRuntimeMetadata.releaseTuple,
             contextManifest: generationRuntimeMetadata.contextManifest,
             contextManifestHash: generationRuntimeMetadata.contextManifestHash,
@@ -9466,7 +9467,7 @@ async function createOrClaimRefillGenerationJob({
 }): Promise<
   | {
       status: "ready";
-      generationJob: ClaimedGenerationJob;
+      generationJob: ClaimedGenerationJob & { retryCount: number };
     }
   | {
       status: "not-ready";
@@ -9511,6 +9512,7 @@ async function createOrClaimRefillGenerationJob({
         id: true,
         attemptCount: true,
         idempotencyKey: true,
+        retryCount: true,
       },
     });
 
@@ -9571,7 +9573,12 @@ async function createOrClaimRefillGenerationJob({
   if (claim.count === 1) {
     const claimedJob = await prisma.generationJob.findUniqueOrThrow({
       where: { id: generationJobId },
-      select: { id: true, attemptCount: true, idempotencyKey: true },
+      select: {
+        id: true,
+        attemptCount: true,
+        idempotencyKey: true,
+        retryCount: true,
+      },
     });
     return {
       status: "ready",

@@ -20,7 +20,11 @@ import {
   prepareAgentMaterialUpload,
   retryAgentMaterialIngestion,
 } from "@/lib/agent-access/material-ingestion";
-import type { MaterialIngestionEventPayload } from "@/lib/jobs/events";
+import type {
+  MaterialIngestionEventPayload,
+  MaterialIngestionEventSender,
+} from "@/lib/jobs/events";
+import { recoverMaterialIngestionPublications } from "@/lib/materials/ingestion-publication";
 import { getPrisma } from "@/lib/prisma";
 import type { SourceObjectStorage } from "@/lib/storage/s3";
 
@@ -93,6 +97,169 @@ describeDatabase("agent material ingestion", () => {
     });
     return buckets.reduce((total, bucket) => total + bucket.count, 0);
   }
+
+  async function queueRecoverableMaterial(
+    auth: AgentAuthClaims,
+    kind: "pdf" | "web",
+    eventSender: MaterialIngestionEventSender,
+  ) {
+    const storage = createMemoryStorage();
+    if (kind === "web") {
+      return importAgentMaterialUrl(
+        auth,
+        {
+          idempotency_key: `reliable_web_${randomUUID()}`,
+          source_url: "https://books.example/intro",
+          selected_urls: ["https://books.example/intro"],
+        },
+        {
+          storage,
+          resolveHostname: async () => ["93.184.216.34"],
+          eventSender,
+        },
+      );
+    }
+    const prepared = await prepareAgentMaterialUpload(
+      auth,
+      {
+        idempotency_key: `reliable_pdf_${randomUUID()}`,
+        title: "Reliable material",
+        original_name: "reliable.pdf",
+        mime_type: "application/pdf",
+        byte_size: 2_048,
+      },
+      { storage },
+    );
+    seedUploadedObject(storage, prepared.upload_url, 2_048);
+    return completeAgentMaterialUpload(
+      auth,
+      {
+        idempotency_key: `reliable_complete_${randomUUID()}`,
+        material_revision_id: prepared.material_revision_id!,
+        operation_id: prepared.operation_id,
+      },
+      { storage, eventSender },
+    );
+  }
+
+  it.each([
+    { kind: "pdf" as const, ambiguous: false },
+    { kind: "web" as const, ambiguous: false },
+    { kind: "pdf" as const, ambiguous: true },
+    { kind: "web" as const, ambiguous: true },
+  ])(
+    "recovers agent $kind publication (ambiguous: $ambiguous) with a stable identity",
+    async ({ kind, ambiguous }) => {
+      const auth = await createAuth(`reliable_${kind}_${ambiguous}`);
+      const sends: Array<{
+        payload: MaterialIngestionEventPayload;
+        eventId?: string;
+      }> = [];
+      const operation = await queueRecoverableMaterial(auth, kind, {
+        async sendMaterialIngestionRequested(payload, options) {
+          sends.push({ payload, eventId: options?.eventId });
+          throw new Error(
+            ambiguous
+              ? "synthetic acknowledgement lost"
+              : "synthetic queue unavailable",
+          );
+        },
+      });
+      expect(operation).toMatchObject({
+        status: "queued",
+        error_code: null,
+        completed_at: null,
+      });
+      const revisionId = operation.material_revision_id!;
+      const revision = await prisma.materialRevision.findUniqueOrThrow({
+        where: { id: revisionId },
+      });
+      expect(revision).toMatchObject({
+        status: "QUEUED",
+        processingMetadata: {
+          ingestionDelivery: {
+            status: "pending",
+            attempt: 1,
+            eventId: sends[0].eventId,
+          },
+        },
+      });
+      expect(sends[0].eventId).toBeTruthy();
+      expect(
+        await prisma.sourceFile.findFirstOrThrow({
+          where: { materialRevisionId: revisionId },
+        }),
+      ).toMatchObject({ status: "UPLOADED" });
+      await prisma.materialRevision.update({
+        where: { id: revisionId },
+        data: { updatedAt: new Date(0) },
+      });
+      await recoverMaterialIngestionPublications({
+        now: new Date(Date.now() + 6 * 60_000),
+        sender: {
+          async sendMaterialIngestionRequested(payload, options) {
+            if (payload.materialRevisionId === revisionId)
+              sends.push({ payload, eventId: options?.eventId });
+          },
+        },
+      });
+      expect(sends).toHaveLength(2);
+      expect(sends[1]).toEqual(sends[0]);
+      expect(
+        await getAgentMaterialOperationStatus(auth, operation.operation_id),
+      ).toMatchObject({ status: "queued", error_code: null });
+      const finalizedAt = new Date();
+      await prisma.materialRevision.update({
+        where: { id: revisionId },
+        data: { status: "READY", finalizedAt },
+      });
+      expect(
+        await getAgentMaterialOperationStatus(auth, operation.operation_id),
+      ).toMatchObject({
+        status: "succeeded",
+        completed_at: finalizedAt.toISOString(),
+      });
+    },
+  );
+
+  it.each(["pdf", "web"] as const)(
+    "reports bounded agent %s publication exhaustion through operation polling",
+    async (kind) => {
+      const auth = await createAuth(`exhausted_${kind}`);
+      let sends = 0;
+      const sender: MaterialIngestionEventSender = {
+        async sendMaterialIngestionRequested() {
+          sends += 1;
+          throw new Error("synthetic persistent queue outage");
+        },
+      };
+      const operation = await queueRecoverableMaterial(auth, kind, sender);
+      expect(operation.status).toBe("queued");
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        await prisma.materialRevision.update({
+          where: { id: operation.material_revision_id! },
+          data: { updatedAt: new Date(0) },
+        });
+        await recoverMaterialIngestionPublications({
+          now: new Date(Date.now() + attempt * 6 * 60_000),
+          sender,
+        });
+      }
+      expect(sends).toBe(5);
+      expect(
+        await getAgentMaterialOperationStatus(auth, operation.operation_id),
+      ).toMatchObject({
+        status: "failed",
+        error_code: "EVENT_SEND_FAILED",
+        retryable: true,
+      });
+      expect(
+        await prisma.sourceFile.findFirstOrThrow({
+          where: { materialRevisionId: operation.material_revision_id! },
+        }),
+      ).toMatchObject({ status: "FAILED" });
+    },
+  );
 
   it("fences concurrent PDF preparation and enqueues one completion", async () => {
     const auth = await createAuth("pdf");
@@ -804,5 +971,8 @@ function seedUploadedObject(
   byteSize: number,
 ) {
   expect(uploadUrl).toMatch(/^https:\/\/uploads\.example\//);
-  storage.objects.set(storageKeyFromUploadUrl(uploadUrl!), Buffer.alloc(byteSize));
+  storage.objects.set(
+    storageKeyFromUploadUrl(uploadUrl!),
+    Buffer.alloc(byteSize),
+  );
 }

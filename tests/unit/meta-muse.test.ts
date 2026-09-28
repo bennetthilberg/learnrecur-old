@@ -246,6 +246,7 @@ describe("Meta Muse Responses client", () => {
     );
     await vi.advanceTimersByTimeAsync(25);
     await expectation;
+    await expect(result).rejects.toMatchObject({ retryable: true });
   });
 
   it("builds data URLs for image and PDF inputs", () => {

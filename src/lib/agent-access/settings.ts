@@ -16,6 +16,8 @@ import { getPrisma } from "@/lib/prisma";
 import { cleanupPreparedSourceUploads } from "@/lib/skills/uploads";
 import { recoverPendingRefillEvents } from "@/lib/skills/refill-jobs";
 import { recoverStaleAgentOperationItems } from "@/lib/agent-access/recovery";
+import { recoverMaterialIngestionPublications } from "@/lib/materials/ingestion-publication";
+import { getSafeJobErrorDetails } from "@/lib/jobs/errors";
 import { JobContinuationLimitError } from "@/lib/jobs/publication-context";
 
 const AGENT_UPLOAD_WINDOW_MS = 10 * 60 * 1_000;
@@ -312,7 +314,7 @@ export async function revokeAgentConnection(input: { userId: string; connectionI
       console.error("[agent-access] WorkOS revocation dispatch deferred", {
         userId: input.userId,
         connectionId: input.connectionId,
-        errorName: error instanceof Error ? error.name : "UnknownError",
+        ...getSafeJobErrorDetails(error),
       });
     }
   }
@@ -528,12 +530,14 @@ export async function runAgentConnectionRevocationJob(input: {
   return { status: "revoked" as const };
 }
 
-export async function runAgentAccessMaintenance(now: Date) {
+export async function runAgentAccessMaintenance(now: Date, options?: { deadlineAt?: Date }) {
   const prisma = getPrisma();
   const uploadCutoff = new Date(now.getTime() - AGENT_UPLOAD_WINDOW_MS);
   let refillRecoveryFailed = false;
+  let materialRecoveryFailed = false;
+  let recoveryCause: unknown;
   let activationRecoveryFailed = false;
-  const [purged, rateBuckets, pending, expiredUploads, refillEvents, activationRecovery] = await Promise.all([
+  const [purged, rateBuckets, pending, expiredUploads, refillEvents, activationRecovery, materialPublications] = await Promise.all([
     prisma.agentSkillOperation.updateMany({
       where: { payloadExpiresAt: { lte: now }, requestPayload: { not: Prisma.DbNull } },
       data: { requestPayload: Prisma.DbNull, payloadExpiresAt: null },
@@ -568,19 +572,21 @@ export async function runAgentAccessMaintenance(now: Date) {
         sources: { select: { sourceFileId: true } },
       },
     }),
-    recoverPendingRefillEvents({ now }).catch((error: unknown) => {
+    recoverPendingRefillEvents({ now, deadlineAt: options?.deadlineAt }).catch((error: unknown) => {
       if (error instanceof JobContinuationLimitError) throw error;
       refillRecoveryFailed = true;
+      recoveryCause ??= error;
       console.error("[agent-access] refill event recovery failed during maintenance", {
-        errorName: error instanceof Error ? error.name : "UnknownError",
+        ...getSafeJobErrorDetails(error),
       });
       return { attempted: 0, delivered: 0, failed: 1 };
     }),
     recoverStaleAgentOperationItems({ now }).catch((error: unknown) => {
       if (error instanceof JobContinuationLimitError) throw error;
       activationRecoveryFailed = true;
+      recoveryCause ??= error;
       console.error("[agent-access] activation item recovery failed during maintenance", {
-        errorName: error instanceof Error ? error.name : "UnknownError",
+        ...getSafeJobErrorDetails(error),
       });
       return {
         scanned: 0,
@@ -592,6 +598,13 @@ export async function runAgentAccessMaintenance(now: Date) {
         continuations: 0,
         continuationPublishFailures: 0,
       };
+    }),
+    recoverMaterialIngestionPublications({ now, deadlineAt: options?.deadlineAt }).catch((error: unknown) => {
+      if (error instanceof JobContinuationLimitError) throw error;
+      materialRecoveryFailed = true;
+      recoveryCause ??= error;
+      console.error("[agent-access] material publication recovery failed during maintenance", getSafeJobErrorDetails(error));
+      return { attempted: 0, delivered: 0, failed: 1 };
     }),
   ]);
   if (activationRecovery.continuationPublishFailures > 0) {
@@ -648,6 +661,9 @@ export async function runAgentAccessMaintenance(now: Date) {
     refillEventsAttempted: refillEvents.attempted,
     refillEventsDelivered: refillEvents.delivered,
     refillEventsFailed: refillEvents.failed,
+    materialPublicationsAttempted: materialPublications.attempted,
+    materialPublicationsDelivered: materialPublications.delivered,
+    materialPublicationsFailed: materialPublications.failed,
     activationItemsScanned: activationRecovery.scanned,
     activationItemsRequeued: activationRecovery.requeued,
     activationItemsFinalized: activationRecovery.finalized,
@@ -656,15 +672,17 @@ export async function runAgentAccessMaintenance(now: Date) {
     activationContinuations: activationRecovery.continuations,
     activationContinuationPublishFailures: activationRecovery.continuationPublishFailures,
   };
-  if (refillRecoveryFailed || activationRecoveryFailed) {
+  if (refillRecoveryFailed || activationRecoveryFailed || materialRecoveryFailed) {
     const failures = [
       ...(refillRecoveryFailed ? ["refill events"] : []),
       ...(activationRecoveryFailed ? ["activation items"] : []),
+      ...(materialRecoveryFailed ? ["material publications"] : []),
     ];
     const retryableError = new Error(
       `Agent access maintenance could not recover ${failures.join(" and ")}.`,
+      { cause: recoveryCause },
     );
-    Object.assign(retryableError, { retryable: true });
+    Object.assign(retryableError, { retryable: true, code: "MAINTENANCE_RECOVERY_FAILED" });
     throw retryableError;
   }
   return result;

@@ -794,7 +794,7 @@ describeDatabase("agent access persistence", () => {
 
     const recovery = vi
       .spyOn(refillJobs, "recoverPendingRefillEvents")
-      .mockRejectedValueOnce(new Error("private database failure"));
+      .mockRejectedValueOnce(Object.assign(new Error("private database failure"), { code: "P2028" }));
     const fetch = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(null, { status: 404 }));
@@ -805,6 +805,7 @@ describeDatabase("agent access persistence", () => {
       await expect(runAgentAccessMaintenance(now)).rejects.toMatchObject({
         message: "Agent access maintenance could not recover refill events.",
         retryable: true,
+        cause: { code: "P2028" },
       });
       expect(recovery).toHaveBeenCalledWith({ now });
       expect(fetch).toHaveBeenCalledTimes(1);

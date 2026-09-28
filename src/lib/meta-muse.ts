@@ -1,3 +1,5 @@
+import { JobStageTimeoutError } from "@/lib/jobs/deadline";
+
 export const DEFAULT_META_MUSE_BASE_URL = "https://api.meta.ai/v1";
 export const DEFAULT_META_MUSE_MODEL = "muse-spark-1.3";
 export const DEFAULT_META_MUSE_REQUEST_TIMEOUT_MS = 60_000;
@@ -82,7 +84,7 @@ export async function runMetaMuseJsonResponse({
   else signal?.addEventListener("abort", abortFromCaller, { once: true });
   const timeoutId = setTimeout(() => {
     abortController.abort(
-      new Error(`${operation} timed out after ${requestTimeoutMs}ms with Meta Muse.`),
+      new JobStageTimeoutError(`${operation} timed out after ${requestTimeoutMs}ms with Meta Muse.`, "meta request"),
     );
   }, requestTimeoutMs);
   const context = {

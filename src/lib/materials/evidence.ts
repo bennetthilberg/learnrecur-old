@@ -48,6 +48,7 @@ const DEFAULT_CONTEXT_CHARACTER_LIMIT = 4_000;
 export const MAX_LAZY_OCR_PAGES_PER_RUN = 8;
 
 export class MaterialEvidencePendingError extends Error {
+  readonly retryable = true;
   constructor() {
     super("Source page OCR is still running. The activation can be retried.");
     this.name = "MaterialEvidencePendingError";

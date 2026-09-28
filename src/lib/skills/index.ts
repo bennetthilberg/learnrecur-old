@@ -90,6 +90,13 @@ import {
 import type { AnswerMode } from "@/lib/skills/exercise-planning";
 import { REFILL_JOB_RETRY_LIMIT } from "@/lib/skills/refill-policy";
 import {
+  runRefillStage,
+  refillStageBudget,
+  refillRetryMetadata,
+  type RefillRuntimeInput,
+  type RefillRetryMetadata,
+} from "@/lib/skills/refill-runtime";
+import {
   buildGenerationQualityContext,
   buildGenerationRuntimeMetadata,
   safeBuildGenerationQualityContext,
@@ -662,7 +669,7 @@ export type AgentCandidateVerificationResult =
       retryable?: boolean;
     };
 
-export type RefillChoiceExercisesInput = {
+export type RefillChoiceExercisesInput = RefillRuntimeInput & {
   userId: string;
   skillId: string;
   now: Date;
@@ -675,7 +682,7 @@ export type RefillChoiceExercisesInput = {
   model?: string;
 };
 
-export type RefillExactInputExercisesInput = {
+export type RefillExactInputExercisesInput = RefillRuntimeInput & {
   userId: string;
   skillId: string;
   now: Date;
@@ -688,7 +695,7 @@ export type RefillExactInputExercisesInput = {
   model?: string;
 };
 
-export type RefillMathExercisesInput = {
+export type RefillMathExercisesInput = RefillRuntimeInput & {
   userId: string;
   skillId: string;
   now: Date;
@@ -795,6 +802,9 @@ export type SkillExerciseRefillResult =
     }
   | {
       status: "not-refilled";
+      retryable?: RefillRetryMetadata["retryable"];
+      failureCode?: RefillRetryMetadata["failureCode"];
+      generationAttempt?: number;
       reason:
         | "already-at-target"
         | "generation-failed"
@@ -827,6 +837,9 @@ export type ExactInputExerciseRefillResult =
     }
   | {
       status: "not-refilled";
+      retryable?: RefillRetryMetadata["retryable"];
+      failureCode?: RefillRetryMetadata["failureCode"];
+      generationAttempt?: number;
       reason:
         | "already-at-target"
         | "exact-input-locked"
@@ -860,6 +873,9 @@ export type MathExerciseRefillResult =
     }
   | {
       status: "not-refilled";
+      retryable?: RefillRetryMetadata["retryable"];
+      failureCode?: RefillRetryMetadata["failureCode"];
+      generationAttempt?: number;
       reason:
         | "already-at-target"
         | "exact-input-locked"
@@ -3922,72 +3938,124 @@ function refillJobNoLongerRunning(
   };
 }
 
+async function runRefillPublication<T>(
+  input: RefillRuntimeInput,
+  job: { id: string; attemptCount: number },
+  run: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
+  const budget = refillStageBudget(input, "refill-publication");
+  return runRefillStage(
+    input,
+    "refill-publication",
+    (signal) =>
+      getPrisma().$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT set_config('statement_timeout', ${String(Math.min(5_000, budget))}, true)`;
+          // Match deletion's account-first lock order. A request accepted
+          // while generation was running must stop publication atomically.
+          const owners = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "users" WHERE "id" = ${input.userId}
+            AND "agentAccessDisabledAt" IS NULL FOR UPDATE
+          `;
+          if (owners.length !== 1 || await tx.accountDeletionJob.findUnique({
+            where: { userId: input.userId },
+            select: { id: true },
+          })) {
+            throw new GenerationPublicationSupersededError();
+          }
+          // Serializes publication against failure/recovery writes for this attempt.
+          const claimed = await tx.$queryRaw<Array<{ id: string }>>`
+            SELECT "id" FROM "generation_jobs" WHERE "id" = ${job.id}
+            AND "status" = 'RUNNING' AND "attemptCount" = ${job.attemptCount} FOR UPDATE
+          `;
+          if (claimed.length !== 1)
+            throw new GenerationPublicationSupersededError();
+          if (signal.aborted) throw signal.reason;
+          const result = await run(tx);
+          if (signal.aborted) throw signal.reason;
+          return result;
+        },
+        { maxWait: Math.min(2_000, budget), timeout: budget },
+      ),
+    job.id,
+  );
+}
+
 export async function refillChoiceExercisesForSkill(
   input: RefillChoiceExercisesInput,
 ): Promise<SkillExerciseRefillResult> {
   const prisma = getPrisma();
+  const eventNow = input.eventNow ?? (() => new Date());
   const targetReadyCount = normalizeReadyExerciseTarget(input.targetReadyCount);
-  const skill = await prisma.skill.findFirst({
-    where: {
-      id: input.skillId,
-      userId: input.userId,
-    },
-    select: {
-      textPolicy: true,
-      textPolicyRevision: true,
-      collection: { select: { textPolicy: true } },
-      id: true,
-      userId: true,
-      title: true,
-      objective: true,
-      rules: true,
-      examples: true,
-      exerciseConstraints: true,
-      tags: true,
-      status: true,
-      fsrsState: true,
-      dueAt: true,
-      repetitions: true,
-      alreadyStudied: true,
-      lapses: true,
-      stability: true,
-      sourceRefs: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          locator: true,
-          sourceFile: {
-            select: {
-              id: true,
-              materialRevisionId: true,
-              kind: true,
-              status: true,
-              originalName: true,
-              mimeType: true,
-              storageBucket: true,
-              storageKey: true,
-              extractedText: true,
+  const skill = await runRefillStage(
+    input,
+    "refill-load",
+    () =>
+      withBoundedActivationRead((tx) =>
+        tx.skill.findFirst({
+          where: {
+            id: input.skillId,
+            userId: input.userId,
+          },
+          select: {
+            textPolicy: true,
+            textPolicyRevision: true,
+            collection: { select: { textPolicy: true } },
+            id: true,
+            userId: true,
+            title: true,
+            objective: true,
+            rules: true,
+            examples: true,
+            exerciseConstraints: true,
+            tags: true,
+            status: true,
+            fsrsState: true,
+            dueAt: true,
+            repetitions: true,
+            alreadyStudied: true,
+            lapses: true,
+            stability: true,
+            sourceRefs: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                locator: true,
+                sourceFile: {
+                  select: {
+                    id: true,
+                    materialRevisionId: true,
+                    kind: true,
+                    status: true,
+                    originalName: true,
+                    mimeType: true,
+                    storageBucket: true,
+                    storageKey: true,
+                    extractedText: true,
+                  },
+                },
+              },
+            },
+            exercises: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                id: true,
+                answerKind: true,
+                verificationStatus: true,
+                retiredAt: true,
+                choices: true,
+                prompt: true,
+                correctAnswerDisplay: true,
+              },
             },
           },
-        },
-      },
-      exercises: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          id: true,
-          answerKind: true,
-          verificationStatus: true,
-          retiredAt: true,
-          choices: true,
-          prompt: true,
-          correctAnswerDisplay: true,
-        },
-      },
-    },
-  });
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (!skill) {
     return skillNotFound();
@@ -4039,17 +4107,25 @@ export async function refillChoiceExercisesForSkill(
   const requestedCount = targetReadyCount - inventory.readyExerciseCount;
   const providerUsage = createAiProviderUsageTracker();
   const setup = resolveActivationSetup(input, providerUsage.record);
-  const generationJobResult = await createOrClaimRefillGenerationJob({
-    prisma,
-    generationJobId: input.generationJobId,
-    userId: input.userId,
-    skillId: skill.id,
-    kind: GenerationJobKind.CHOICE_EXERCISE_GENERATION,
-    promptVersion: SKILL_MCQ_PROMPT_VERSION,
-    setup,
-    requestedCount,
-    now: input.now,
-  });
+  const generationJobResult = await runRefillStage(
+    input,
+    "refill-reservation",
+    () =>
+      withBoundedActivationRead((tx) =>
+        createOrClaimRefillGenerationJob({
+          prisma: tx,
+          generationJobId: input.generationJobId,
+          userId: input.userId,
+          skillId: skill.id,
+          kind: GenerationJobKind.CHOICE_EXERCISE_GENERATION,
+          promptVersion: SKILL_MCQ_PROMPT_VERSION,
+          setup,
+          requestedCount,
+          now: input.now,
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (generationJobResult.status === "not-ready") {
     return {
@@ -4075,26 +4151,42 @@ export async function refillChoiceExercisesForSkill(
     };
   }
 
-  const existingExerciseContext = buildExistingChoiceExerciseContext(skill.exercises);
+  const existingExerciseContext = buildExistingChoiceExerciseContext(
+    skill.exercises,
+  );
   let sourceContext: string | null;
   let sourceMedia: SourceMediaContext[];
 
   try {
-    const sourceEvidence = await resolveGroundedSkillSourceEvidence({
-      userId: input.userId,
-      sourceRefs: skill.sourceRefs,
-      sourceMediaLoader: input.sourceMediaLoader,
-      sourceEvidenceLoader: input.sourceEvidenceLoader,
-    });
+    const sourceEvidence = await runRefillStage(
+      input,
+      "refill-source-evidence",
+      (signal) =>
+        resolveGroundedSkillSourceEvidence({
+          userId: input.userId,
+          sourceRefs: skill.sourceRefs,
+          sourceMediaLoader: input.sourceMediaLoader,
+          sourceEvidenceLoader: input.sourceEvidenceLoader,
+          signal,
+        }),
+      generationJob.id,
+    );
     sourceContext = sourceEvidence.sourceContext;
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "source",
+      generationJob.attemptCount,
+    );
     const message = buildSourceMediaLoadFailureMessage(error);
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4107,6 +4199,7 @@ export async function refillChoiceExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -4116,7 +4209,20 @@ export async function refillChoiceExercisesForSkill(
   }
 
   const qualityContextResult = safeBuildGenerationQualityContext({
-    recentEvidence: await loadGenerationRecentEvidence({ userId: input.userId, skillId: skill.id, now: input.now }),
+    recentEvidence: await runRefillStage(
+      input,
+      "refill-recent-history",
+      () =>
+        withBoundedActivationRead((tx) =>
+          loadGenerationRecentEvidence({
+            userId: input.userId,
+            skillId: skill.id,
+            now: input.now,
+            prisma: tx,
+          }),
+        ),
+      generationJob.id,
+    ),
     skill,
     sourceContext,
     sourceEvidence: skill.sourceRefs.map((sourceRef) => ({
@@ -4132,7 +4238,8 @@ export async function refillChoiceExercisesForSkill(
       message: qualityContextResult.message,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       failureCategory: qualityContextResult.failureCategory,
       providerUsage: providerUsage.latest(),
     });
@@ -4157,25 +4264,35 @@ export async function refillChoiceExercisesForSkill(
   let rawGeneration: unknown;
 
   try {
-    rawGeneration = await withTimeout(
-      setup.generateChoiceExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        requestedCount,
-      }),
-      ACTIVATION_PROVIDER_CHAIN_TIMEOUT_MS,
-      "generateChoiceExercises timed out",
+    rawGeneration = await runRefillStage(
+      input,
+      "refill-generation",
+      (signal) =>
+        setup.generateChoiceExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          requestedCount,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "generation",
+      generationJob.attemptCount,
+    );
     const message = `Gemini exercise generation failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4188,6 +4305,7 @@ export async function refillChoiceExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -4221,7 +4339,8 @@ export async function refillChoiceExercisesForSkill(
       message: validation.message,
       acceptedCount: validation.validCount,
       rejectedCount: validation.rejectedCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4242,7 +4361,10 @@ export async function refillChoiceExercisesForSkill(
     };
   }
 
-  const deduplicated = filterDuplicateChoiceExercises(validation.exercises, skill.exercises);
+  const deduplicated = filterDuplicateChoiceExercises(
+    validation.exercises,
+    skill.exercises,
+  );
 
   if (deduplicated.exercises.length === 0) {
     const message = "Gemini returned only duplicate exercises for this skill.";
@@ -4250,7 +4372,8 @@ export async function refillChoiceExercisesForSkill(
       message,
       acceptedCount: 0,
       rejectedCount: validation.rejectedCount + deduplicated.duplicateCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4271,7 +4394,9 @@ export async function refillChoiceExercisesForSkill(
     };
   }
 
-  const candidates = toGeneratedChoiceExerciseCandidates(deduplicated.exercises);
+  const candidates = toGeneratedChoiceExerciseCandidates(
+    deduplicated.exercises,
+  );
   const verifyingMarked = await markGenerationJobStage(
     prisma,
     generationJob.id,
@@ -4290,26 +4415,38 @@ export async function refillChoiceExercisesForSkill(
   let rawVerification: unknown;
 
   try {
-    rawVerification = await withTimeout(
-      setup.verifyChoiceExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        candidates,
-      }),
-      CHOICE_VERIFICATION_TIMEOUT_MS,
-      "verifyChoiceExercises timed out",
+    rawVerification = await runRefillStage(
+      input,
+      "refill-verification",
+      (signal) =>
+        setup.verifyChoiceExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          candidates,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "verification",
+      generationJob.attemptCount,
+    );
     const message = `Gemini exercise verification failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + deduplicated.exercises.length,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        deduplicated.exercises.length,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4322,6 +4459,7 @@ export async function refillChoiceExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "verification-failed",
       message,
       generationJobId: generationJob.id,
@@ -4345,8 +4483,11 @@ export async function refillChoiceExercisesForSkill(
       message: verification.message,
       acceptedCount: verification.verifiedCount,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        verification.rejectedCount,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4395,162 +4536,173 @@ export async function refillChoiceExercisesForSkill(
   }
 
   return mapGenerationPublicationRace(
-    prisma.$transaction(async (tx) => {
-    const currentSkill = await tx.skill.findFirst({
-      where: {
-        id: skill.id,
-        userId: input.userId,
-        status: SkillStatus.ACTIVE,
-      },
-      select: {
-        id: true,
-        exercises: {
-          select: {
-            answerKind: true,
-            verificationStatus: true,
-            retiredAt: true,
-            choices: true,
+    runRefillPublication(input, generationJob, async (tx) => {
+      const currentSkill = await tx.skill.findFirst({
+        where: {
+          id: skill.id,
+          userId: input.userId,
+          status: SkillStatus.ACTIVE,
+        },
+        select: {
+          id: true,
+          exercises: {
+            select: {
+              answerKind: true,
+              verificationStatus: true,
+              retiredAt: true,
+              choices: true,
+            },
           },
         },
-      },
-    });
-
-    if (!currentSkill) {
-      await tx.generationJob.update({
-        where: { id: generationJob.id },
-        data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill is no longer active.",
-          completedAt: input.now,
-        },
       });
 
-      return {
-        status: "not-refilled",
-        reason: "skill-not-active",
-        message: "Skill is no longer active.",
-        generationJobId: generationJob.id,
-      };
-    }
+      if (!currentSkill) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill is no longer active.",
+            completedAt: eventNow(),
+          },
+        });
 
-    const currentInventory = countChoiceExerciseInventory(currentSkill.exercises);
+        return {
+          status: "not-refilled",
+          reason: "skill-not-active",
+          message: "Skill is no longer active.",
+          generationJobId: generationJob.id,
+        };
+      }
 
-    if (currentInventory.readyExerciseCount >= targetReadyCount) {
-      await tx.generationJob.update({
-        where: { id: generationJob.id },
-        data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill already reached the ready exercise target.",
-          completedAt: input.now,
-        },
+      const currentInventory = countChoiceExerciseInventory(
+        currentSkill.exercises,
+      );
+
+      if (currentInventory.readyExerciseCount >= targetReadyCount) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill already reached the ready exercise target.",
+            completedAt: eventNow(),
+          },
+        });
+
+        return {
+          status: "not-refilled",
+          reason: "already-at-target",
+          message: "This skill already has enough ready practice exercises.",
+          generationJobId: generationJob.id,
+          readyExerciseCount: currentInventory.readyExerciseCount,
+          targetReadyCount,
+        };
+      }
+
+      await tx.exercise.createMany({
+        data: verification.exercises.map((exercise) => ({
+          ...toPersistedChoiceQuality({
+            context: qualityContext,
+            candidateId: exercise.candidateId,
+            slotIndex: getCandidateSlotIndex(candidates, exercise.candidateId),
+            exercise,
+          }),
+          userId: input.userId,
+          skillId: skill.id,
+          type: ExerciseType.MULTIPLE_CHOICE,
+          answerKind: AnswerKind.CHOICE,
+          prompt: exercise.prompt,
+          choices: exercise.choices,
+          answerSpec: exercise.answerSpec,
+          correctAnswerDisplay: exercise.correctAnswerDisplay,
+          explanation: exercise.explanation,
+          difficulty: exercise.difficulty,
+          expectedSeconds: exercise.expectedSeconds,
+          verificationStatus: ExerciseVerificationStatus.VERIFIED,
+        })),
       });
 
-      return {
-        status: "not-refilled",
-        reason: "already-at-target",
-        message: "This skill already has enough ready practice exercises.",
-        generationJobId: generationJob.id,
-        readyExerciseCount: currentInventory.readyExerciseCount,
-        targetReadyCount,
-      };
-    }
-
-    await tx.exercise.createMany({
-      data: verification.exercises.map((exercise) => ({
-        ...toPersistedChoiceQuality({
-          context: qualityContext,
-          candidateId: exercise.candidateId,
-          slotIndex: getCandidateSlotIndex(candidates, exercise.candidateId),
-          exercise,
-        }),
-        userId: input.userId,
-        skillId: skill.id,
-        type: ExerciseType.MULTIPLE_CHOICE,
-        answerKind: AnswerKind.CHOICE,
-        prompt: exercise.prompt,
-        choices: exercise.choices,
-        answerSpec: exercise.answerSpec,
-        correctAnswerDisplay: exercise.correctAnswerDisplay,
-        explanation: exercise.explanation,
-        difficulty: exercise.difficulty,
-        expectedSeconds: exercise.expectedSeconds,
-        verificationStatus: ExerciseVerificationStatus.VERIFIED,
-      })),
-    });
-
-    const refillStageMetrics = {
-      requestedCount,
-      candidateCount: validation.exercises.length,
-      acceptedCount: verification.exercises.length,
-      rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-    };
-    const publishedJob = await tx.generationJob.updateMany({
-      where: {
-        id: generationJob.id,
-        status: GenerationJobStatus.RUNNING,
-        stage: GenerationJobStage.PUBLISHING,
-        attemptCount: generationJob.attemptCount,
-      },
-      data: {
-        ...buildGenerationJobProviderUpdate(providerUsage.latest()),
-        status: GenerationJobStatus.SUCCEEDED,
-        stage: GenerationJobStage.COMPLETE,
-        checkpoint: "published",
-        releaseTuple: generationRuntimeMetadata.releaseTuple,
-        contextManifest: generationRuntimeMetadata.contextManifest,
-        contextManifestHash: generationRuntimeMetadata.contextManifestHash,
-        stageMetrics: refillStageMetrics,
-        failureCategory: GenerationFailureCategory.NONE,
+      const refillStageMetrics = {
+        requestedCount,
+        candidateCount: validation.exercises.length,
         acceptedCount: verification.exercises.length,
         rejectedCount:
-          validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-        completedAt: input.now,
-      },
-    });
-    if (publishedJob.count !== 1) {
-      throw new GenerationPublicationSupersededError();
-    }
-    await tx.generationAuditRecord.createMany({
-      data: [{
-        userId: input.userId,
-        jobId: generationJob.id,
-        skillId: skill.id,
-        idempotencyKey: generationJob.idempotencyKey ?? generationJob.id,
-        eventKey: "publication-complete",
-        stage: GenerationJobStage.COMPLETE,
-        checkpoint: "published",
-        attempt: 1,
-        releaseTuple: generationRuntimeMetadata.releaseTuple,
-        contextManifest: generationRuntimeMetadata.contextManifest,
-        contextManifestHash: generationRuntimeMetadata.contextManifestHash,
-        stageMetrics: refillStageMetrics,
-        degradedState: effectiveProvider.provider === META_MUSE_PROVIDER
-          ? GenerationDegradedState.FALLBACK_USED
-          : GenerationDegradedState.NONE,
-        decision: GenerationAuditDecision.PUBLISHED,
-      }],
-      skipDuplicates: true,
-    });
+          validation.rejectedCount +
+          deduplicated.duplicateCount +
+          verification.rejectedCount,
+      };
+      const publishedJob = await tx.generationJob.updateMany({
+        where: {
+          id: generationJob.id,
+          status: GenerationJobStatus.RUNNING,
+          stage: GenerationJobStage.PUBLISHING,
+          attemptCount: generationJob.attemptCount,
+        },
+        data: {
+          ...buildGenerationJobProviderUpdate(providerUsage.latest()),
+          status: GenerationJobStatus.SUCCEEDED,
+          stage: GenerationJobStage.COMPLETE,
+          checkpoint: "published",
+          releaseTuple: generationRuntimeMetadata.releaseTuple,
+          contextManifest: generationRuntimeMetadata.contextManifest,
+          contextManifestHash: generationRuntimeMetadata.contextManifestHash,
+          stageMetrics: refillStageMetrics,
+          failureCategory: GenerationFailureCategory.NONE,
+          acceptedCount: verification.exercises.length,
+          rejectedCount:
+            validation.rejectedCount +
+            deduplicated.duplicateCount +
+            verification.rejectedCount,
+          completedAt: eventNow(),
+        },
+      });
+      if (publishedJob.count !== 1) {
+        throw new GenerationPublicationSupersededError();
+      }
+      await tx.generationAuditRecord.createMany({
+        data: [
+          {
+            userId: input.userId,
+            jobId: generationJob.id,
+            skillId: skill.id,
+            idempotencyKey: generationJob.idempotencyKey ?? generationJob.id,
+            eventKey: "publication-complete",
+            stage: GenerationJobStage.COMPLETE,
+            checkpoint: "published",
+            attempt: 1,
+            releaseTuple: generationRuntimeMetadata.releaseTuple,
+            contextManifest: generationRuntimeMetadata.contextManifest,
+            contextManifestHash: generationRuntimeMetadata.contextManifestHash,
+            stageMetrics: refillStageMetrics,
+            degradedState:
+              effectiveProvider.provider === META_MUSE_PROVIDER
+                ? GenerationDegradedState.FALLBACK_USED
+                : GenerationDegradedState.NONE,
+            decision: GenerationAuditDecision.PUBLISHED,
+          },
+        ],
+        skipDuplicates: true,
+      });
 
-    return {
-      status: "refilled",
-      skillId: skill.id,
-      generationJobId: generationJob.id,
-      exerciseCount: verification.exercises.length,
-      readyExerciseCount: currentInventory.readyExerciseCount + verification.exercises.length,
-      targetReadyCount,
-    };
+      return {
+        status: "refilled",
+        skillId: skill.id,
+        generationJobId: generationJob.id,
+        exerciseCount: verification.exercises.length,
+        readyExerciseCount:
+          currentInventory.readyExerciseCount + verification.exercises.length,
+        targetReadyCount,
+      };
     }),
-    () => refillJobNoLongerRunning(
-      generationJob.id,
-      inventory.readyExerciseCount,
-      targetReadyCount,
-    ),
+    () =>
+      refillJobNoLongerRunning(
+        generationJob.id,
+        inventory.readyExerciseCount,
+        targetReadyCount,
+      ),
   );
 }
 
@@ -4558,71 +4710,80 @@ export async function refillExactInputExercisesForSkill(
   input: RefillExactInputExercisesInput,
 ): Promise<ExactInputExerciseRefillResult> {
   const prisma = getPrisma();
+  const eventNow = input.eventNow ?? (() => new Date());
   const targetReadyCount = normalizeReadyExerciseTarget(
     input.targetReadyCount,
     DEFAULT_READY_EXACT_INPUT_TARGET,
   );
-  const skill = await prisma.skill.findFirst({
-    where: {
-      id: input.skillId,
-      userId: input.userId,
-    },
-    select: {
-      id: true,
-      userId: true,
-      textPolicy: true,
-      textPolicyRevision: true,
-      collection: { select: { textPolicy: true } },
-      title: true,
-      objective: true,
-      rules: true,
-      examples: true,
-      exerciseConstraints: true,
-      tags: true,
-      status: true,
-      repetitions: true,
-      alreadyStudied: true,
-      fsrsState: true,
-      dueAt: true,
-      lapses: true,
-      stability: true,
-      sourceRefs: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          locator: true,
-          sourceFile: {
-            select: {
-              id: true,
-              materialRevisionId: true,
-              kind: true,
-              status: true,
-              originalName: true,
-              mimeType: true,
-              storageBucket: true,
-              storageKey: true,
-              extractedText: true,
+  const skill = await runRefillStage(
+    input,
+    "refill-load",
+    () =>
+      withBoundedActivationRead((tx) =>
+        tx.skill.findFirst({
+          where: {
+            id: input.skillId,
+            userId: input.userId,
+          },
+          select: {
+            id: true,
+            userId: true,
+            textPolicy: true,
+            textPolicyRevision: true,
+            collection: { select: { textPolicy: true } },
+            title: true,
+            objective: true,
+            rules: true,
+            examples: true,
+            exerciseConstraints: true,
+            tags: true,
+            status: true,
+            repetitions: true,
+            alreadyStudied: true,
+            fsrsState: true,
+            dueAt: true,
+            lapses: true,
+            stability: true,
+            sourceRefs: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                locator: true,
+                sourceFile: {
+                  select: {
+                    id: true,
+                    materialRevisionId: true,
+                    kind: true,
+                    status: true,
+                    originalName: true,
+                    mimeType: true,
+                    storageBucket: true,
+                    storageKey: true,
+                    extractedText: true,
+                  },
+                },
+              },
+            },
+            exercises: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                id: true,
+                answerKind: true,
+                answerSpec: true,
+                verificationStatus: true,
+                retiredAt: true,
+                prompt: true,
+                correctAnswerDisplay: true,
+              },
             },
           },
-        },
-      },
-      exercises: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          id: true,
-          answerKind: true,
-          answerSpec: true,
-          verificationStatus: true,
-          retiredAt: true,
-          prompt: true,
-          correctAnswerDisplay: true,
-        },
-      },
-    },
-  });
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (!skill) {
     return skillNotFound();
@@ -4682,17 +4843,25 @@ export async function refillExactInputExercisesForSkill(
   const requestedCount = targetReadyCount - inventory.readyExerciseCount;
   const providerUsage = createAiProviderUsageTracker();
   const setup = resolveExactInputRefillSetup(input, providerUsage.record);
-  const generationJobResult = await createOrClaimRefillGenerationJob({
-    prisma,
-    generationJobId: input.generationJobId,
-    userId: input.userId,
-    skillId: skill.id,
-    kind: GenerationJobKind.EXACT_INPUT_EXERCISE_GENERATION,
-    promptVersion: SKILL_EXACT_INPUT_PROMPT_VERSION,
-    setup,
-    requestedCount,
-    now: input.now,
-  });
+  const generationJobResult = await runRefillStage(
+    input,
+    "refill-reservation",
+    () =>
+      withBoundedActivationRead((tx) =>
+        createOrClaimRefillGenerationJob({
+          prisma: tx,
+          generationJobId: input.generationJobId,
+          userId: input.userId,
+          skillId: skill.id,
+          kind: GenerationJobKind.EXACT_INPUT_EXERCISE_GENERATION,
+          promptVersion: SKILL_EXACT_INPUT_PROMPT_VERSION,
+          setup,
+          requestedCount,
+          now: input.now,
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (generationJobResult.status === "not-ready") {
     return {
@@ -4718,23 +4887,38 @@ export async function refillExactInputExercisesForSkill(
     };
   }
 
-  const existingExerciseContext = buildExistingExactInputExerciseContext(skill.exercises);
+  const existingExerciseContext = buildExistingExactInputExerciseContext(
+    skill.exercises,
+  );
   let sourceContext: string | null;
   let sourceMedia: SourceMediaContext[];
 
   try {
-    const sourceEvidence = await resolveGroundedSkillSourceEvidence({
-      userId: input.userId,
-      sourceRefs: skill.sourceRefs,
-      sourceMediaLoader: input.sourceMediaLoader,
-      sourceEvidenceLoader: input.sourceEvidenceLoader,
-    });
+    const sourceEvidence = await runRefillStage(
+      input,
+      "refill-source-evidence",
+      (signal) =>
+        resolveGroundedSkillSourceEvidence({
+          userId: input.userId,
+          sourceRefs: skill.sourceRefs,
+          sourceMediaLoader: input.sourceMediaLoader,
+          sourceEvidenceLoader: input.sourceEvidenceLoader,
+          signal,
+        }),
+      generationJob.id,
+    );
     sourceContext = sourceEvidence.sourceContext;
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "source",
+      generationJob.attemptCount,
+    );
     const message = buildSourceMediaLoadFailureMessage(error);
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
       now: input.now,
@@ -4749,6 +4933,7 @@ export async function refillExactInputExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -4758,39 +4943,81 @@ export async function refillExactInputExercisesForSkill(
   }
 
   const qualityContextResult = safeBuildGenerationQualityContext({
-    skill, sourceContext, requestedCount, now: input.now,
+    skill,
+    sourceContext,
+    requestedCount,
+    now: input.now,
     answerModes: ["text", "numeric"],
-    recentEvidence: await loadGenerationRecentEvidence({ userId: input.userId, skillId: skill.id, now: input.now }),
-    sourceEvidence: skill.sourceRefs.map((ref) => ({ sourceFileId: ref.sourceFile.id, revisionId: ref.sourceFile.materialRevisionId, locator: ref.locator })),
+    recentEvidence: await runRefillStage(
+      input,
+      "refill-recent-history",
+      () =>
+        withBoundedActivationRead((tx) =>
+          loadGenerationRecentEvidence({
+            userId: input.userId,
+            skillId: skill.id,
+            now: input.now,
+            prisma: tx,
+          }),
+        ),
+      generationJob.id,
+    ),
+    sourceEvidence: skill.sourceRefs.map((ref) => ({
+      sourceFileId: ref.sourceFile.id,
+      revisionId: ref.sourceFile.materialRevisionId,
+      locator: ref.locator,
+    })),
   });
   if (qualityContextResult.status === "invalid") {
-    await markGenerationJobFailed(prisma, generationJob.id, {message: qualityContextResult.message, acceptedCount: 0, rejectedCount: 0, now: input.now, failureCategory: qualityContextResult.failureCategory});
-    return {status: "not-refilled", reason: "generation-failed", message: qualityContextResult.message, generationJobId: generationJob.id};
+    await markGenerationJobFailed(prisma, generationJob.id, {
+      message: qualityContextResult.message,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
+      failureCategory: qualityContextResult.failureCategory,
+    });
+    return {
+      status: "not-refilled",
+      reason: "generation-failed",
+      message: qualityContextResult.message,
+      generationJobId: generationJob.id,
+    };
   }
   const qualityContext = qualityContextResult.context;
 
   let rawGeneration: unknown;
 
   try {
-    rawGeneration = await withTimeout(
-      setup.generateExactInputExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        requestedCount,
-      }),
-      GENERATION_TIMEOUT_MS,
-      "generateExactInputExercises timed out",
+    rawGeneration = await runRefillStage(
+      input,
+      "refill-generation",
+      (signal) =>
+        setup.generateExactInputExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          requestedCount,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "generation",
+      generationJob.attemptCount,
+    );
     const message = `Gemini exact-input exercise generation failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4803,6 +5030,7 @@ export async function refillExactInputExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -4814,7 +5042,10 @@ export async function refillExactInputExercisesForSkill(
   const validation = validateGeneratedExactInputExercises(rawGeneration, {
     minValidExercises: 1,
     maxGeneratedExercises: requestedCount,
-    textPolicy: resolveTextPolicy({ skill: skill.textPolicy, collection: skill.collection?.textPolicy }),
+    textPolicy: resolveTextPolicy({
+      skill: skill.textPolicy,
+      collection: skill.collection?.textPolicy,
+    }),
   });
 
   if (validation.status === "invalid") {
@@ -4822,7 +5053,8 @@ export async function refillExactInputExercisesForSkill(
       message: validation.message,
       acceptedCount: validation.validCount,
       rejectedCount: validation.rejectedCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4843,15 +5075,20 @@ export async function refillExactInputExercisesForSkill(
     };
   }
 
-  const deduplicated = filterDuplicateExactInputExercises(validation.exercises, skill.exercises);
+  const deduplicated = filterDuplicateExactInputExercises(
+    validation.exercises,
+    skill.exercises,
+  );
 
   if (deduplicated.exercises.length === 0) {
-    const message = "Gemini returned only duplicate exact-input exercises for this skill.";
+    const message =
+      "Gemini returned only duplicate exact-input exercises for this skill.";
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
       acceptedCount: 0,
       rejectedCount: validation.rejectedCount + deduplicated.duplicateCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4872,35 +5109,50 @@ export async function refillExactInputExercisesForSkill(
     };
   }
 
-  const candidates = toGeneratedExactInputExerciseCandidates(deduplicated.exercises);
+  const candidates = toGeneratedExactInputExerciseCandidates(
+    deduplicated.exercises,
+  );
   // Deduplication preserves object identity; keep positions from the original
   // generated batch across deterministic rejection and verification filtering.
-  const candidateSlotIndexes = deduplicated.exercises.map((exercise) =>
-    validation.sourceIndexes[validation.exercises.indexOf(exercise)],
+  const candidateSlotIndexes = deduplicated.exercises.map(
+    (exercise) =>
+      validation.sourceIndexes[validation.exercises.indexOf(exercise)],
   );
   let rawVerification: unknown;
 
   try {
-    rawVerification = await withTimeout(
-      setup.verifyExactInputExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        candidates,
-      }),
-      GENERATION_TIMEOUT_MS,
-      "verifyExactInputExercises timed out",
+    rawVerification = await runRefillStage(
+      input,
+      "refill-verification",
+      (signal) =>
+        setup.verifyExactInputExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          candidates,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "verification",
+      generationJob.attemptCount,
+    );
     const message = `Gemini exact-input exercise verification failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + deduplicated.exercises.length,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        deduplicated.exercises.length,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4913,6 +5165,7 @@ export async function refillExactInputExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "verification-failed",
       message,
       generationJobId: generationJob.id,
@@ -4936,8 +5189,11 @@ export async function refillExactInputExercisesForSkill(
       message: verification.message,
       acceptedCount: verification.verifiedCount,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        verification.rejectedCount,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -4967,197 +5223,237 @@ export async function refillExactInputExercisesForSkill(
     verifiedCandidateIds.has(candidate.candidateId),
   );
 
-  return prisma.$transaction(async (tx) => {
-    const locked = await tx.$queryRaw<Array<{ textPolicyRevision: number }>>`
+  return mapGenerationPublicationRace(
+    runRefillPublication(input, generationJob, async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ textPolicyRevision: number }>>`
       SELECT "textPolicyRevision" FROM "skills"
       WHERE "id" = ${skill.id} AND "userId" = ${input.userId} FOR UPDATE
     `;
-    if (locked[0]?.textPolicyRevision !== skill.textPolicyRevision) {
-      await tx.generationJob.updateMany({ where: { id: generationJob.id, status: "RUNNING" }, data: { status: "FAILED", stage: "FAILED", failureCategory: "CANCELED", errorMessage: "Text policy changed during preparation.", completedAt: input.now } });
-      return refillJobNoLongerRunning(generationJob.id, 0, targetReadyCount);
-    }
-    const currentSkill = await tx.skill.findFirst({
-      where: {
-        id: skill.id,
-        userId: input.userId,
-        status: SkillStatus.ACTIVE,
-      },
-      select: {
-        id: true,
-        repetitions: true,
-        alreadyStudied: true,
-        exercises: {
-          select: {
-            answerKind: true,
-            verificationStatus: true,
-            retiredAt: true,
-            answerSpec: true,
+      if (locked[0]?.textPolicyRevision !== skill.textPolicyRevision) {
+        await tx.generationJob.updateMany({
+          where: { id: generationJob.id, status: "RUNNING" },
+          data: {
+            status: "FAILED",
+            stage: "FAILED",
+            failureCategory: "CANCELED",
+            errorMessage: "Text policy changed during preparation.",
+            completedAt: eventNow(),
+          },
+        });
+        return refillJobNoLongerRunning(generationJob.id, 0, targetReadyCount);
+      }
+      const currentSkill = await tx.skill.findFirst({
+        where: {
+          id: skill.id,
+          userId: input.userId,
+          status: SkillStatus.ACTIVE,
+        },
+        select: {
+          id: true,
+          repetitions: true,
+          alreadyStudied: true,
+          exercises: {
+            select: {
+              answerKind: true,
+              verificationStatus: true,
+              retiredAt: true,
+              answerSpec: true,
+            },
           },
         },
-      },
-    });
+      });
 
-    if (!currentSkill || !isExactInputUnlocked(currentSkill.repetitions, currentSkill.alreadyStudied)) {
+      if (
+        !currentSkill ||
+        !isExactInputUnlocked(
+          currentSkill.repetitions,
+          currentSkill.alreadyStudied,
+        )
+      ) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill is not ready for exact-input practice.",
+            completedAt: eventNow(),
+          },
+        });
+
+        return {
+          status: "not-refilled",
+          reason: currentSkill ? "exact-input-locked" : "skill-not-active",
+          message: "Skill is not ready for exact-input practice.",
+          generationJobId: generationJob.id,
+        };
+      }
+
+      const currentInventory = countExactInputExerciseInventory(
+        currentSkill.exercises,
+      );
+
+      if (currentInventory.readyExerciseCount >= targetReadyCount) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill already reached the ready exact-input target.",
+            completedAt: eventNow(),
+          },
+        });
+
+        return {
+          status: "not-refilled",
+          reason: "already-at-target",
+          message: "This skill already has enough ready exact-input exercises.",
+          generationJobId: generationJob.id,
+          readyExerciseCount: currentInventory.readyExerciseCount,
+          targetReadyCount,
+        };
+      }
+
+      await tx.exercise.createMany({
+        data: verifiedCandidates.map((exercise) => ({
+          ...toPersistedInputQuality({
+            exercise,
+            context: qualityContext,
+            slotIndex:
+              candidateSlotIndexes[
+                getCandidateSlotIndex(candidates, exercise.candidateId)
+              ],
+          }),
+          userId: input.userId,
+          skillId: skill.id,
+          type: ExerciseType.EXACT_INPUT,
+          answerKind: exercise.answerKind,
+          prompt: exercise.prompt,
+          choices: Prisma.JsonNull,
+          answerSpec: exercise.answerSpec,
+          correctAnswerDisplay: exercise.correctAnswerDisplay,
+          explanation: exercise.explanation,
+          difficulty: exercise.difficulty,
+          expectedSeconds: exercise.expectedSeconds,
+          verificationStatus: ExerciseVerificationStatus.VERIFIED,
+        })),
+      });
+
       await tx.generationJob.update({
         where: { id: generationJob.id },
         data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill is not ready for exact-input practice.",
-          completedAt: input.now,
+          ...buildGenerationJobProviderUpdate(providerUsage.latest()),
+          status: GenerationJobStatus.SUCCEEDED,
+          stage: GenerationJobStage.COMPLETE,
+          checkpoint: "published",
+          failureCategory: GenerationFailureCategory.NONE,
+          acceptedCount: verification.exercises.length,
+          rejectedCount:
+            validation.rejectedCount +
+            deduplicated.duplicateCount +
+            verification.rejectedCount,
+          completedAt: eventNow(),
         },
       });
 
       return {
-        status: "not-refilled",
-        reason: currentSkill ? "exact-input-locked" : "skill-not-active",
-        message: "Skill is not ready for exact-input practice.",
+        status: "refilled",
+        skillId: skill.id,
         generationJobId: generationJob.id,
-      };
-    }
-
-    const currentInventory = countExactInputExerciseInventory(currentSkill.exercises);
-
-    if (currentInventory.readyExerciseCount >= targetReadyCount) {
-      await tx.generationJob.update({
-        where: { id: generationJob.id },
-        data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill already reached the ready exact-input target.",
-          completedAt: input.now,
-        },
-      });
-
-      return {
-        status: "not-refilled",
-        reason: "already-at-target",
-        message: "This skill already has enough ready exact-input exercises.",
-        generationJobId: generationJob.id,
-        readyExerciseCount: currentInventory.readyExerciseCount,
+        exerciseCount: verification.exercises.length,
+        readyExerciseCount:
+          currentInventory.readyExerciseCount + verification.exercises.length,
         targetReadyCount,
       };
-    }
-
-    await tx.exercise.createMany({
-      data: verifiedCandidates.map((exercise) => ({
-        ...toPersistedInputQuality({
-          exercise,
-          context: qualityContext,
-          slotIndex: candidateSlotIndexes[getCandidateSlotIndex(candidates, exercise.candidateId)],
-        }),
-        userId: input.userId,
-        skillId: skill.id,
-        type: ExerciseType.EXACT_INPUT,
-        answerKind: exercise.answerKind,
-        prompt: exercise.prompt,
-        choices: Prisma.JsonNull,
-        answerSpec: exercise.answerSpec,
-        correctAnswerDisplay: exercise.correctAnswerDisplay,
-        explanation: exercise.explanation,
-        difficulty: exercise.difficulty,
-        expectedSeconds: exercise.expectedSeconds,
-        verificationStatus: ExerciseVerificationStatus.VERIFIED,
-      })),
-    });
-
-    await tx.generationJob.update({
-      where: { id: generationJob.id },
-      data: {
-        ...buildGenerationJobProviderUpdate(providerUsage.latest()),
-        status: GenerationJobStatus.SUCCEEDED,
-        stage: GenerationJobStage.COMPLETE,
-        checkpoint: "published",
-        failureCategory: GenerationFailureCategory.NONE,
-        acceptedCount: verification.exercises.length,
-        rejectedCount:
-          validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-        completedAt: input.now,
-      },
-    });
-
-    return {
-      status: "refilled",
-      skillId: skill.id,
-      generationJobId: generationJob.id,
-      exerciseCount: verification.exercises.length,
-      readyExerciseCount: currentInventory.readyExerciseCount + verification.exercises.length,
-      targetReadyCount,
-    };
-  });
+    }),
+    () =>
+      refillJobNoLongerRunning(
+        generationJob.id,
+        inventory.readyExerciseCount,
+        targetReadyCount,
+      ),
+  );
 }
 
 export async function refillMathExercisesForSkill(
   input: RefillMathExercisesInput,
 ): Promise<MathExerciseRefillResult> {
   const prisma = getPrisma();
+  const eventNow = input.eventNow ?? (() => new Date());
   const targetReadyCount = normalizeReadyExerciseTarget(
     input.targetReadyCount,
     DEFAULT_READY_MATH_TARGET,
   );
-  const skill = await prisma.skill.findFirst({
-    where: {
-      id: input.skillId,
-      userId: input.userId,
-    },
-    select: {
-      textPolicy: true,
-      textPolicyRevision: true,
-      collection: { select: { textPolicy: true } },
-      id: true,
-      userId: true,
-      title: true,
-      objective: true,
-      rules: true,
-      examples: true,
-      exerciseConstraints: true,
-      tags: true,
-      status: true,
-      repetitions: true,
-      alreadyStudied: true,
-      fsrsState: true,
-      dueAt: true,
-      lapses: true,
-      stability: true,
-      sourceRefs: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          locator: true,
-          sourceFile: {
-            select: {
-              id: true,
-              materialRevisionId: true,
-              kind: true,
-              status: true,
-              originalName: true,
-              mimeType: true,
-              storageBucket: true,
-              storageKey: true,
-              extractedText: true,
+  const skill = await runRefillStage(
+    input,
+    "refill-load",
+    () =>
+      withBoundedActivationRead((tx) =>
+        tx.skill.findFirst({
+          where: {
+            id: input.skillId,
+            userId: input.userId,
+          },
+          select: {
+            textPolicy: true,
+            textPolicyRevision: true,
+            collection: { select: { textPolicy: true } },
+            id: true,
+            userId: true,
+            title: true,
+            objective: true,
+            rules: true,
+            examples: true,
+            exerciseConstraints: true,
+            tags: true,
+            status: true,
+            repetitions: true,
+            alreadyStudied: true,
+            fsrsState: true,
+            dueAt: true,
+            lapses: true,
+            stability: true,
+            sourceRefs: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                locator: true,
+                sourceFile: {
+                  select: {
+                    id: true,
+                    materialRevisionId: true,
+                    kind: true,
+                    status: true,
+                    originalName: true,
+                    mimeType: true,
+                    storageBucket: true,
+                    storageKey: true,
+                    extractedText: true,
+                  },
+                },
+              },
+            },
+            exercises: {
+              orderBy: {
+                createdAt: "asc",
+              },
+              select: {
+                id: true,
+                answerKind: true,
+                answerSpec: true,
+                verificationStatus: true,
+                retiredAt: true,
+                prompt: true,
+                correctAnswerDisplay: true,
+              },
             },
           },
-        },
-      },
-      exercises: {
-        orderBy: {
-          createdAt: "asc",
-        },
-        select: {
-          id: true,
-          answerKind: true,
-          answerSpec: true,
-          verificationStatus: true,
-          retiredAt: true,
-          prompt: true,
-          correctAnswerDisplay: true,
-        },
-      },
-    },
-  });
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (!skill) {
     return skillNotFound();
@@ -5217,17 +5513,25 @@ export async function refillMathExercisesForSkill(
   const requestedCount = targetReadyCount - inventory.readyExerciseCount;
   const providerUsage = createAiProviderUsageTracker();
   const setup = resolveMathRefillSetup(input, providerUsage.record);
-  const generationJobResult = await createOrClaimRefillGenerationJob({
-    prisma,
-    generationJobId: input.generationJobId,
-    userId: input.userId,
-    skillId: skill.id,
-    kind: GenerationJobKind.MATH_EXERCISE_GENERATION,
-    promptVersion: SKILL_MATH_PROMPT_VERSION,
-    setup,
-    requestedCount,
-    now: input.now,
-  });
+  const generationJobResult = await runRefillStage(
+    input,
+    "refill-reservation",
+    () =>
+      withBoundedActivationRead((tx) =>
+        createOrClaimRefillGenerationJob({
+          prisma: tx,
+          generationJobId: input.generationJobId,
+          userId: input.userId,
+          skillId: skill.id,
+          kind: GenerationJobKind.MATH_EXERCISE_GENERATION,
+          promptVersion: SKILL_MATH_PROMPT_VERSION,
+          setup,
+          requestedCount,
+          now: input.now,
+        }),
+      ),
+    input.generationJobId,
+  );
 
   if (generationJobResult.status === "not-ready") {
     return {
@@ -5253,23 +5557,38 @@ export async function refillMathExercisesForSkill(
     };
   }
 
-  const existingExerciseContext = buildExistingMathExerciseContext(skill.exercises);
+  const existingExerciseContext = buildExistingMathExerciseContext(
+    skill.exercises,
+  );
   let sourceContext: string | null;
   let sourceMedia: SourceMediaContext[];
 
   try {
-    const sourceEvidence = await resolveGroundedSkillSourceEvidence({
-      userId: input.userId,
-      sourceRefs: skill.sourceRefs,
-      sourceMediaLoader: input.sourceMediaLoader,
-      sourceEvidenceLoader: input.sourceEvidenceLoader,
-    });
+    const sourceEvidence = await runRefillStage(
+      input,
+      "refill-source-evidence",
+      (signal) =>
+        resolveGroundedSkillSourceEvidence({
+          userId: input.userId,
+          sourceRefs: skill.sourceRefs,
+          sourceMediaLoader: input.sourceMediaLoader,
+          sourceEvidenceLoader: input.sourceEvidenceLoader,
+          signal,
+        }),
+      generationJob.id,
+    );
     sourceContext = sourceEvidence.sourceContext;
     sourceMedia = sourceEvidence.sourceMedia;
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "source",
+      generationJob.attemptCount,
+    );
     const message = buildSourceMediaLoadFailureMessage(error);
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
       now: input.now,
@@ -5284,6 +5603,7 @@ export async function refillMathExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -5293,42 +5613,84 @@ export async function refillMathExercisesForSkill(
   }
 
   const qualityContextResult = safeBuildGenerationQualityContext({
-    skill, sourceContext, requestedCount, now: input.now,
+    skill,
+    sourceContext,
+    requestedCount,
+    now: input.now,
     answerModes: ["math"],
     // The selected math-preparation operation supplies this capability. The
     // generator and verifier still enforce the unchanged skill objective.
     subjectCapability: "symbolic_numeric",
-    recentEvidence: await loadGenerationRecentEvidence({ userId: input.userId, skillId: skill.id, now: input.now }),
-    sourceEvidence: skill.sourceRefs.map((ref) => ({ sourceFileId: ref.sourceFile.id, revisionId: ref.sourceFile.materialRevisionId, locator: ref.locator })),
+    recentEvidence: await runRefillStage(
+      input,
+      "refill-recent-history",
+      () =>
+        withBoundedActivationRead((tx) =>
+          loadGenerationRecentEvidence({
+            userId: input.userId,
+            skillId: skill.id,
+            now: input.now,
+            prisma: tx,
+          }),
+        ),
+      generationJob.id,
+    ),
+    sourceEvidence: skill.sourceRefs.map((ref) => ({
+      sourceFileId: ref.sourceFile.id,
+      revisionId: ref.sourceFile.materialRevisionId,
+      locator: ref.locator,
+    })),
   });
   if (qualityContextResult.status === "invalid") {
-    await markGenerationJobFailed(prisma, generationJob.id, {message: qualityContextResult.message, acceptedCount: 0, rejectedCount: 0, now: input.now, failureCategory: qualityContextResult.failureCategory});
-    return {status: "not-refilled", reason: "generation-failed", message: qualityContextResult.message, generationJobId: generationJob.id};
+    await markGenerationJobFailed(prisma, generationJob.id, {
+      message: qualityContextResult.message,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
+      failureCategory: qualityContextResult.failureCategory,
+    });
+    return {
+      status: "not-refilled",
+      reason: "generation-failed",
+      message: qualityContextResult.message,
+      generationJobId: generationJob.id,
+    };
   }
   const qualityContext = qualityContextResult.context;
 
   let rawGeneration: unknown;
 
   try {
-    rawGeneration = await withTimeout(
-      setup.generateMathExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        requestedCount,
-      }),
-      GENERATION_TIMEOUT_MS,
-      "generateMathExercises timed out",
+    rawGeneration = await runRefillStage(
+      input,
+      "refill-generation",
+      (signal) =>
+        setup.generateMathExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          requestedCount,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "generation",
+      generationJob.attemptCount,
+    );
     const message = `Gemini math exercise generation failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -5341,6 +5703,7 @@ export async function refillMathExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "generation-failed",
       message,
       generationJobId: generationJob.id,
@@ -5359,7 +5722,8 @@ export async function refillMathExercisesForSkill(
       message: validation.message,
       acceptedCount: validation.validCount,
       rejectedCount: validation.rejectedCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -5380,15 +5744,20 @@ export async function refillMathExercisesForSkill(
     };
   }
 
-  const deduplicated = filterDuplicateMathExercises(validation.exercises, skill.exercises);
+  const deduplicated = filterDuplicateMathExercises(
+    validation.exercises,
+    skill.exercises,
+  );
 
   if (deduplicated.exercises.length === 0) {
-    const message = "Gemini returned only duplicate math exercises for this skill.";
+    const message =
+      "Gemini returned only duplicate math exercises for this skill.";
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
       acceptedCount: 0,
       rejectedCount: validation.rejectedCount + deduplicated.duplicateCount,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -5412,32 +5781,45 @@ export async function refillMathExercisesForSkill(
   const candidates = toGeneratedMathExerciseCandidates(deduplicated.exercises);
   // Deduplication preserves object identity; keep positions from the original
   // generated batch across deterministic rejection and verification filtering.
-  const candidateSlotIndexes = deduplicated.exercises.map((exercise) =>
-    validation.sourceIndexes[validation.exercises.indexOf(exercise)],
+  const candidateSlotIndexes = deduplicated.exercises.map(
+    (exercise) =>
+      validation.sourceIndexes[validation.exercises.indexOf(exercise)],
   );
   let rawVerification: unknown;
 
   try {
-    rawVerification = await withTimeout(
-      setup.verifyMathExercises({
-        skill,
-        sourceContext,
-        sourceMedia,
-        existingExerciseContext,
-        qualityContext,
-        candidates,
-      }),
-      GENERATION_TIMEOUT_MS,
-      "verifyMathExercises timed out",
+    rawVerification = await runRefillStage(
+      input,
+      "refill-verification",
+      (signal) =>
+        setup.verifyMathExercises({
+          skill,
+          sourceContext,
+          sourceMedia,
+          existingExerciseContext,
+          qualityContext,
+          candidates,
+          signal,
+        }),
+      generationJob.id,
     );
   } catch (error) {
+    const retryMetadata = refillRetryMetadata(
+      error,
+      "verification",
+      generationJob.attemptCount,
+    );
     const message = `Gemini math exercise verification failed: ${formatEnvError(error)}`;
     const jobFailed = await markGenerationJobFailed(prisma, generationJob.id, {
       message,
+      retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + deduplicated.exercises.length,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        deduplicated.exercises.length,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -5450,6 +5832,7 @@ export async function refillMathExercisesForSkill(
 
     return {
       status: "not-refilled",
+      ...retryMetadata,
       reason: "verification-failed",
       message,
       generationJobId: generationJob.id,
@@ -5473,8 +5856,11 @@ export async function refillMathExercisesForSkill(
       message: verification.message,
       acceptedCount: verification.verifiedCount,
       rejectedCount:
-        validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-      now: input.now,
+        validation.rejectedCount +
+        deduplicated.duplicateCount +
+        verification.rejectedCount,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
       providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
@@ -5504,118 +5890,140 @@ export async function refillMathExercisesForSkill(
     verifiedCandidateIds.has(candidate.candidateId),
   );
 
-  return prisma.$transaction(async (tx) => {
-    const currentSkill = await tx.skill.findFirst({
-      where: {
-        id: skill.id,
-        userId: input.userId,
-        status: SkillStatus.ACTIVE,
-      },
-      select: {
-        id: true,
-        repetitions: true,
-        alreadyStudied: true,
-        exercises: {
-          select: {
-            answerKind: true,
-            verificationStatus: true,
-            retiredAt: true,
-            answerSpec: true,
+  return mapGenerationPublicationRace(
+    runRefillPublication(input, generationJob, async (tx) => {
+      const currentSkill = await tx.skill.findFirst({
+        where: {
+          id: skill.id,
+          userId: input.userId,
+          status: SkillStatus.ACTIVE,
+        },
+        select: {
+          id: true,
+          repetitions: true,
+          alreadyStudied: true,
+          exercises: {
+            select: {
+              answerKind: true,
+              verificationStatus: true,
+              retiredAt: true,
+              answerSpec: true,
+            },
           },
         },
-      },
-    });
+      });
 
-    if (!currentSkill || !isExactInputUnlocked(currentSkill.repetitions, currentSkill.alreadyStudied)) {
+      if (
+        !currentSkill ||
+        !isExactInputUnlocked(
+          currentSkill.repetitions,
+          currentSkill.alreadyStudied,
+        )
+      ) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill is not ready for math practice.",
+            completedAt: eventNow(),
+          },
+        });
+
+        return {
+          status: "not-refilled",
+          reason: currentSkill ? "exact-input-locked" : "skill-not-active",
+          message: "Skill is not ready for math practice.",
+          generationJobId: generationJob.id,
+        };
+      }
+
+      const currentInventory = countMathExerciseInventory(
+        currentSkill.exercises,
+      );
+
+      if (currentInventory.readyExerciseCount >= targetReadyCount) {
+        await tx.generationJob.update({
+          where: { id: generationJob.id },
+          data: {
+            status: GenerationJobStatus.FAILED,
+            stage: GenerationJobStage.FAILED,
+            failureCategory: GenerationFailureCategory.CANCELED,
+            errorMessage: "Skill already reached the ready math target.",
+            completedAt: eventNow(),
+          },
+        });
+
+        return {
+          status: "not-refilled",
+          reason: "already-at-target",
+          message: "This skill already has enough ready math exercises.",
+          generationJobId: generationJob.id,
+          readyExerciseCount: currentInventory.readyExerciseCount,
+          targetReadyCount,
+        };
+      }
+
+      await tx.exercise.createMany({
+        data: verifiedCandidates.map((exercise) => ({
+          ...toPersistedInputQuality({
+            exercise,
+            context: qualityContext,
+            slotIndex:
+              candidateSlotIndexes[
+                getCandidateSlotIndex(candidates, exercise.candidateId)
+              ],
+          }),
+          userId: input.userId,
+          skillId: skill.id,
+          type: ExerciseType.EXACT_INPUT,
+          answerKind: AnswerKind.MATH,
+          prompt: exercise.prompt,
+          choices: Prisma.JsonNull,
+          answerSpec: exercise.answerSpec,
+          correctAnswerDisplay: exercise.correctAnswerDisplay,
+          explanation: exercise.explanation,
+          difficulty: exercise.difficulty,
+          expectedSeconds: exercise.expectedSeconds,
+          verificationStatus: ExerciseVerificationStatus.VERIFIED,
+        })),
+      });
+
       await tx.generationJob.update({
         where: { id: generationJob.id },
         data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill is not ready for math practice.",
-          completedAt: input.now,
+          ...buildGenerationJobProviderUpdate(providerUsage.latest()),
+          status: GenerationJobStatus.SUCCEEDED,
+          stage: GenerationJobStage.COMPLETE,
+          checkpoint: "published",
+          failureCategory: GenerationFailureCategory.NONE,
+          acceptedCount: verification.exercises.length,
+          rejectedCount:
+            validation.rejectedCount +
+            deduplicated.duplicateCount +
+            verification.rejectedCount,
+          completedAt: eventNow(),
         },
       });
 
       return {
-        status: "not-refilled",
-        reason: currentSkill ? "exact-input-locked" : "skill-not-active",
-        message: "Skill is not ready for math practice.",
+        status: "refilled",
+        skillId: skill.id,
         generationJobId: generationJob.id,
-      };
-    }
-
-    const currentInventory = countMathExerciseInventory(currentSkill.exercises);
-
-    if (currentInventory.readyExerciseCount >= targetReadyCount) {
-      await tx.generationJob.update({
-        where: { id: generationJob.id },
-        data: {
-          status: GenerationJobStatus.FAILED,
-          stage: GenerationJobStage.FAILED,
-          failureCategory: GenerationFailureCategory.CANCELED,
-          errorMessage: "Skill already reached the ready math target.",
-          completedAt: input.now,
-        },
-      });
-
-      return {
-        status: "not-refilled",
-        reason: "already-at-target",
-        message: "This skill already has enough ready math exercises.",
-        generationJobId: generationJob.id,
-        readyExerciseCount: currentInventory.readyExerciseCount,
+        exerciseCount: verification.exercises.length,
+        readyExerciseCount:
+          currentInventory.readyExerciseCount + verification.exercises.length,
         targetReadyCount,
       };
-    }
-
-    await tx.exercise.createMany({
-      data: verifiedCandidates.map((exercise) => ({
-        ...toPersistedInputQuality({
-          exercise,
-          context: qualityContext,
-          slotIndex: candidateSlotIndexes[getCandidateSlotIndex(candidates, exercise.candidateId)],
-        }),
-        userId: input.userId,
-        skillId: skill.id,
-        type: ExerciseType.EXACT_INPUT,
-        answerKind: AnswerKind.MATH,
-        prompt: exercise.prompt,
-        choices: Prisma.JsonNull,
-        answerSpec: exercise.answerSpec,
-        correctAnswerDisplay: exercise.correctAnswerDisplay,
-        explanation: exercise.explanation,
-        difficulty: exercise.difficulty,
-        expectedSeconds: exercise.expectedSeconds,
-        verificationStatus: ExerciseVerificationStatus.VERIFIED,
-      })),
-    });
-
-    await tx.generationJob.update({
-      where: { id: generationJob.id },
-      data: {
-        ...buildGenerationJobProviderUpdate(providerUsage.latest()),
-        status: GenerationJobStatus.SUCCEEDED,
-        stage: GenerationJobStage.COMPLETE,
-        checkpoint: "published",
-        failureCategory: GenerationFailureCategory.NONE,
-        acceptedCount: verification.exercises.length,
-        rejectedCount:
-          validation.rejectedCount + deduplicated.duplicateCount + verification.rejectedCount,
-        completedAt: input.now,
-      },
-    });
-
-    return {
-      status: "refilled",
-      skillId: skill.id,
-      generationJobId: generationJob.id,
-      exerciseCount: verification.exercises.length,
-      readyExerciseCount: currentInventory.readyExerciseCount + verification.exercises.length,
-      targetReadyCount,
-    };
-  });
+    }),
+    () =>
+      refillJobNoLongerRunning(
+        generationJob.id,
+        inventory.readyExerciseCount,
+        targetReadyCount,
+      ),
+  );
 }
 
 export function validateGeneratedChoiceExercises(
@@ -8609,20 +9017,26 @@ async function markGenerationJobFailed(
     now: Date;
     failureCategory?: GenerationFailureCategory;
     providerUsage?: AiProviderUsage | null;
+    attemptCount?: number;
+    retryable?: boolean;
   },
 ) {
-  const failureCategory = input.failureCategory ?? classifyGenerationFailure(input.message);
+  const failureCategory =
+    input.failureCategory ?? classifyGenerationFailure(input.message);
   return prisma.$transaction(async (tx) => {
     const updated = await tx.generationJob.updateMany({
       where: {
         id: generationJobId,
         status: GenerationJobStatus.RUNNING,
+        ...(input.attemptCount !== undefined
+          ? { attemptCount: input.attemptCount }
+          : {}),
       },
       data: {
         ...buildGenerationJobProviderUpdate(input.providerUsage ?? null),
         status: GenerationJobStatus.FAILED,
         stage: GenerationJobStage.FAILED,
-        checkpoint: "failed",
+        checkpoint: input.retryable ? "retryable-exception" : "failed",
         failureCategory,
         acceptedCount: input.acceptedCount,
         rejectedCount: input.rejectedCount,
@@ -8655,35 +9069,39 @@ async function markGenerationJobFailed(
       },
     });
     await tx.generationAuditRecord.createMany({
-      data: [{
-        userId: job.userId,
-        jobId: job.id,
-        skillId: job.skillId,
-        idempotencyKey: job.idempotencyKey ?? job.id,
-        eventKey: `failure-${job.attemptCount}-${job.retryCount}`,
-        stage: GenerationJobStage.FAILED,
-        checkpoint: "failed",
-        attempt: job.attemptCount,
-        retryCount: job.retryCount,
-        releaseTuple: (job.releaseTuple ?? {
-          provider: job.provider,
-          model: job.model,
-          generationPromptVersion: job.promptVersion,
-        }) as Prisma.InputJsonValue,
-        contextManifest: job.contextManifest as Prisma.InputJsonValue | undefined,
-        contextManifestHash: job.contextManifestHash,
-        stageMetrics: {
-          requestedCount: job.requestedCount,
-          acceptedCount: input.acceptedCount,
-          rejectedCount: input.rejectedCount,
-          attemptCount: job.attemptCount,
+      data: [
+        {
+          userId: job.userId,
+          jobId: job.id,
+          skillId: job.skillId,
+          idempotencyKey: job.idempotencyKey ?? job.id,
+          eventKey: `failure-${job.attemptCount}-${job.retryCount}`,
+          stage: GenerationJobStage.FAILED,
+          checkpoint: input.retryable ? "retryable-exception" : "failed",
+          attempt: job.attemptCount,
+          retryCount: job.retryCount,
+          releaseTuple: (job.releaseTuple ?? {
+            provider: job.provider,
+            model: job.model,
+            generationPromptVersion: job.promptVersion,
+          }) as Prisma.InputJsonValue,
+          contextManifest: job.contextManifest as
+            | Prisma.InputJsonValue
+            | undefined,
+          contextManifestHash: job.contextManifestHash,
+          stageMetrics: {
+            requestedCount: job.requestedCount,
+            acceptedCount: input.acceptedCount,
+            rejectedCount: input.rejectedCount,
+            attemptCount: job.attemptCount,
+          },
+          failureCategory,
+          degradedState: job.degradedState,
+          decision: GenerationAuditDecision.FAILED,
+          generationReleaseId: job.generationReleaseId,
+          verifierReleaseId: job.verifierReleaseId,
         },
-        failureCategory,
-        degradedState: job.degradedState,
-        decision: GenerationAuditDecision.FAILED,
-        generationReleaseId: job.generationReleaseId,
-        verifierReleaseId: job.verifierReleaseId,
-      }],
+      ],
       skipDuplicates: true,
     });
     return true;
@@ -9059,13 +9477,20 @@ async function createOrClaimRefillGenerationJob({
     userId,
     skillId,
     kind,
-    status: setup.status === "ready" ? GenerationJobStatus.RUNNING : GenerationJobStatus.FAILED,
-    stage: setup.status === "ready" ? GenerationJobStage.GENERATING : GenerationJobStage.FAILED,
+    status:
+      setup.status === "ready"
+        ? GenerationJobStatus.RUNNING
+        : GenerationJobStatus.FAILED,
+    stage:
+      setup.status === "ready"
+        ? GenerationJobStage.GENERATING
+        : GenerationJobStage.FAILED,
     checkpoint: setup.status === "ready" ? "claimed" : "configuration-failed",
     attemptCount: 1,
-    failureCategory: setup.status === "ready"
-      ? GenerationFailureCategory.NONE
-      : GenerationFailureCategory.AUTHENTICATION,
+    failureCategory:
+      setup.status === "ready"
+        ? GenerationFailureCategory.NONE
+        : GenerationFailureCategory.AUTHENTICATION,
     provider: GEMINI_PROVIDER,
     model: setup.model,
     degradedState: GenerationDegradedState.NONE,
@@ -9108,28 +9533,39 @@ async function createOrClaimRefillGenerationJob({
           checkpoint: "retryable-exception",
           retryCount: { lt: REFILL_JOB_RETRY_LIMIT },
         },
+        // A lost send response can exhaust publication retries even though
+        // SQS accepted the event. Its arrival proves there is work to claim;
+        // no generation attempt has run yet.
+        {
+          status: GenerationJobStatus.FAILED,
+          checkpoint: "event-send-failed",
+          failureCategory: GenerationFailureCategory.TRANSPORT,
+          attemptCount: 0,
+        },
       ],
     },
-    select: { status: true, updatedAt: true },
+    select: { status: true, updatedAt: true, attemptCount: true },
   });
   const claim = claimableJob
     ? await prisma.generationJob.updateMany({
-    where: {
-      id: generationJobId,
-      userId,
-      skillId,
-      kind,
-      status: claimableJob.status,
-      updatedAt: claimableJob.updatedAt,
-    },
-    data: {
-      ...data,
-      attemptCount: { increment: 1 },
-      retryCount: claimableJob.status === GenerationJobStatus.FAILED
-        ? { increment: 1 }
-        : 0,
-    },
-  })
+        where: {
+          id: generationJobId,
+          userId,
+          skillId,
+          kind,
+          status: claimableJob.status,
+          updatedAt: claimableJob.updatedAt,
+        },
+        data: {
+          ...data,
+          attemptCount: { increment: 1 },
+          retryCount:
+            claimableJob.status === GenerationJobStatus.FAILED &&
+            claimableJob.attemptCount > 0
+              ? { increment: 1 }
+              : 0,
+        },
+      })
     : { count: 0 };
 
   if (claim.count === 1) {

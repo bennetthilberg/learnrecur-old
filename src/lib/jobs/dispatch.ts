@@ -13,6 +13,7 @@ import type { JobEnvelope } from "./contracts";
 import type { JobExecutionContext } from "./worker";
 import { recoverInterruptedJob } from "./recovery";
 import { withWorkerJobPublicationContext } from "./publication-context";
+import { RetryableRefillError } from "./errors";
 
 export function executeJob(job: JobEnvelope, context: JobExecutionContext): Promise<unknown> {
   return withWorkerJobPublicationContext(
@@ -30,10 +31,14 @@ async function executeJobInPublicationContext(job: JobEnvelope, context: JobExec
       const run = job.name === "learnrecur/choice-refill.requested" ? runChoiceExerciseRefillJob
         : job.name === "learnrecur/exact-input-refill.requested" ? runExactInputExerciseRefillJob : runMathExerciseRefillJob;
       try {
-        return await run({ ...job.data, now: new Date() });
+        const result = await run({ ...job.data, now: new Date(), ...(context.deadlineAt ? { deadlineAt: context.deadlineAt } : {}) });
+        if (result?.status === "not-refilled" && result.retryable && result.failureCode) {
+          throw new RetryableRefillError(result.failureCode, result.generationAttempt);
+        }
+        return result;
       } catch (error) {
         try {
-          await markRefillJobRetryableFailure({ ...job.data, now: new Date(), error });
+          await markRefillJobRetryableFailure({ ...job.data, now: new Date(), error, terminal: context.attempt + 1 >= context.maxAttempts });
         } catch {
           console.error(JSON.stringify({ component: "background-jobs", outcome: "REFILL_FAILURE_RECORDING_FAILED" }));
         }
@@ -63,7 +68,7 @@ async function executeJobInPublicationContext(job: JobEnvelope, context: JobExec
     case "learnrecur/account-deletion.recovery":
       return recoverRetryableAccountDeletionJobs({ now: new Date() });
     case "learnrecur/agent-access.maintenance":
-      return runAgentAccessMaintenance(new Date());
+      return context.deadlineAt ? runAgentAccessMaintenance(new Date(), { deadlineAt: context.deadlineAt }) : runAgentAccessMaintenance(new Date());
     case "learnrecur/practice-reminders.due":
       return processDueReminderBatch({ accountEmailResolver: resolveClerkReminderAccountEmail, now: new Date() });
     default: {

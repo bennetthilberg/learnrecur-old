@@ -24,8 +24,8 @@ export function createJobPublisher(config: JobsConfig) {
         MessageDeduplicationId: job.id,
       }), options?.signal ? { abortSignal: options.signal } : undefined);
       if (!response.MessageId) throw new Error("JOB_RECEIPT_MISSING");
-    } catch {
-      throw new Error("JOB_PUBLISH_FAILED");
+    } catch (cause) {
+      throw Object.assign(new Error("JOB_PUBLISH_FAILED", { cause }), { code: "JOB_PUBLISH_FAILED" });
     }
   };
 }

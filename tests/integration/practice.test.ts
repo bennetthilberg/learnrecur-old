@@ -1801,13 +1801,12 @@ describeDatabase("practice review service", () => {
     expect(result).toMatchObject({
       status: "flagged",
       refill: {
-        status: "not-queued",
-        reason: "event-send-failed",
+        status: "queued",
       },
     });
 
-    if (result.status !== "flagged" || result.refill.status !== "not-queued") {
-      throw new Error("Expected flagging to succeed while refill queueing fails.");
+    if (result.status !== "flagged" || result.refill.status !== "queued") {
+      throw new Error("Expected flagging and durable refill intent to be saved.");
     }
 
     await expect(
@@ -1834,8 +1833,8 @@ describeDatabase("practice review service", () => {
       1,
       {
         kind: GenerationJobKind.CHOICE_EXERCISE_GENERATION,
-        status: GenerationJobStatus.FAILED,
-        errorMessage: "Exercise preparation could not be delivered. Retry the repair.",
+        status: GenerationJobStatus.PENDING,
+        errorMessage: null,
       },
     ]);
   });

@@ -59,10 +59,11 @@ export type AgentConnectionRevocationEventPayload = z.infer<
 >;
 export type AccountDeletionEventPayload = z.infer<typeof accountDeletionEventPayloadSchema>;
 
+export type JobPublicationOptions = { eventId?: string; signal?: AbortSignal };
 export type ExerciseRefillEventSender = {
-  sendChoiceRefillRequested(payload: ExerciseRefillEventPayload): Promise<void>;
-  sendExactInputRefillRequested(payload: ExerciseRefillEventPayload): Promise<void>;
-  sendMathRefillRequested(payload: ExerciseRefillEventPayload): Promise<void>;
+  sendChoiceRefillRequested(payload: ExerciseRefillEventPayload, options?: JobPublicationOptions): Promise<void>;
+  sendExactInputRefillRequested(payload: ExerciseRefillEventPayload, options?: JobPublicationOptions): Promise<void>;
+  sendMathRefillRequested(payload: ExerciseRefillEventPayload, options?: JobPublicationOptions): Promise<void>;
 };
 
 export type SourceUploadDraftEventSender = {
@@ -70,7 +71,7 @@ export type SourceUploadDraftEventSender = {
 };
 
 export type MaterialIngestionEventSender = {
-  sendMaterialIngestionRequested(payload: MaterialIngestionEventPayload): Promise<void>;
+  sendMaterialIngestionRequested(payload: MaterialIngestionEventPayload, options?: JobPublicationOptions): Promise<void>;
 };
 
 export type MaterialCleanupEventSender = {
@@ -138,14 +139,14 @@ export function parseAccountDeletionEventPayload(input: unknown): AccountDeletio
 }
 
 export const awsExerciseRefillEventSender: ExerciseRefillEventSender = {
-  async sendChoiceRefillRequested(payload) {
-    await publishJob(CHOICE_REFILL_REQUESTED_EVENT, payload);
+  async sendChoiceRefillRequested(payload, options) {
+    await publishJob(CHOICE_REFILL_REQUESTED_EVENT, payload, { id: options?.eventId, signal: options?.signal });
   },
-  async sendExactInputRefillRequested(payload) {
-    await publishJob(EXACT_INPUT_REFILL_REQUESTED_EVENT, payload);
+  async sendExactInputRefillRequested(payload, options) {
+    await publishJob(EXACT_INPUT_REFILL_REQUESTED_EVENT, payload, { id: options?.eventId, signal: options?.signal });
   },
-  async sendMathRefillRequested(payload) {
-    await publishJob(MATH_REFILL_REQUESTED_EVENT, payload);
+  async sendMathRefillRequested(payload, options) {
+    await publishJob(MATH_REFILL_REQUESTED_EVENT, payload, { id: options?.eventId, signal: options?.signal });
   },
 };
 
@@ -156,8 +157,8 @@ export const awsSourceUploadDraftEventSender: SourceUploadDraftEventSender = {
 };
 
 export const awsMaterialIngestionEventSender: MaterialIngestionEventSender = {
-  async sendMaterialIngestionRequested(payload) {
-    await publishJob(MATERIAL_INGESTION_REQUESTED_EVENT, payload);
+  async sendMaterialIngestionRequested(payload, options) {
+    await publishJob(MATERIAL_INGESTION_REQUESTED_EVENT, payload, { id: options?.eventId, signal: options?.signal });
   },
 };
 

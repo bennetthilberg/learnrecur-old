@@ -8,6 +8,7 @@ vi.mock("@aws-sdk/client-sqs", () => ({
 
 import { getJobsConfig, getJobsEnvStatus } from "@/lib/jobs/config";
 import { createJobPublisher } from "@/lib/jobs/publisher";
+import { getSafeJobErrorDetails } from "@/lib/jobs/errors";
 import {
   getJobMessageGroupId,
   MAX_JOB_CONTINUATION_DEPTH,
@@ -94,6 +95,17 @@ describe("AWS job publishing", () => {
   it("surfaces failed enqueue without exposing the provider response", async () => {
     send.mockRejectedValue(new Error("sensitive provider response"));
     await expect(createJobPublisher(getJobsConfig(env))("learnrecur/agent-skill-operation.requested", data)).rejects.toThrow("JOB_PUBLISH_FAILED");
+  });
+
+  it("retains approved transport diagnostics behind the public enqueue error", async () => {
+    send.mockRejectedValue(Object.assign(new Error("private response body"), { code: "ECONNRESET" }));
+    try {
+      await createJobPublisher(getJobsConfig(env))("learnrecur/agent-skill-operation.requested", data);
+      throw new Error("expected failure");
+    } catch (error) {
+      expect((error as Error).message).toBe("JOB_PUBLISH_FAILED");
+      expect(getSafeJobErrorDetails(error)).toEqual({ errorCode: "JOB_PUBLISH_FAILED", causeCode: "ECONNRESET" });
+    }
   });
 
   it("rejects an enqueue response that lacks a message receipt", async () => {

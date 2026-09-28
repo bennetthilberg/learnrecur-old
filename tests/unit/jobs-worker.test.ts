@@ -38,6 +38,7 @@ function setup() {
     fail: vi.fn().mockResolvedValue(undefined),
     execute: vi.fn().mockResolvedValue(undefined),
     deadLetter: vi.fn().mockResolvedValue(undefined),
+    finalize: vi.fn().mockResolvedValue(undefined),
     retry: vi.fn().mockResolvedValue(undefined),
     log: vi.fn(),
     now: () => new Date("2026-09-04T21:00:00.000Z"),
@@ -46,6 +47,22 @@ function setup() {
 }
 
 describe("SQS worker delivery safety", () => {
+  it("finalizes exhausted domain work before acknowledging a dead letter", async () => {
+    const { dependencies, run } = setup();
+    vi.mocked(dependencies.claim).mockResolvedValue({ status: "dead-letter", reason: "JOB_RETRIES_EXHAUSTED" });
+    await run({ Records: [record()] });
+    expect(dependencies.finalize).toHaveBeenCalledWith(expect.objectContaining({ name: "learnrecur/choice-refill.requested" }), "JOB_RETRIES_EXHAUSTED");
+    expect(vi.mocked(dependencies.finalize).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(dependencies.deadLetter).mock.invocationCallOrder[0]);
+    expect(dependencies.execute).not.toHaveBeenCalled();
+  });
+
+  it("keeps a terminal message available if domain finalization fails", async () => {
+    const { dependencies, run } = setup();
+    vi.mocked(dependencies.claim).mockResolvedValue({ status: "dead-letter", reason: "JOB_RETRIES_EXHAUSTED" });
+    vi.mocked(dependencies.finalize).mockRejectedValue({ code: "P2028" });
+    expect(await run({ Records: [record()] })).toEqual({ batchItemFailures: [{ itemIdentifier: "message-a" }] });
+    expect(dependencies.deadLetter).not.toHaveBeenCalled();
+  });
   it("acknowledges only after execution and durable completion", async () => {
     const { dependencies, run } = setup();
     expect(await run({ Records: [record()] })).toEqual({ batchItemFailures: [] });
@@ -132,6 +149,27 @@ describe("SQS worker delivery safety", () => {
     expect(await run({ Records: [record()] })).toEqual({ batchItemFailures: [] });
     expect(dependencies.deadLetter).toHaveBeenCalledWith(expect.anything(), "JOB_NON_RETRYABLE");
     expect(dependencies.fail).toHaveBeenCalledWith(expect.anything(), "lease", "JOB_NON_RETRYABLE", true);
+  });
+  it("shortens claimed visibility before execution while keeping it beyond the worker's hard lifetime", async () => {
+    const { dependencies, run } = setup();
+    await run({ Records: [record()] });
+    expect(dependencies.retry).toHaveBeenCalledWith(expect.anything(), 720);
+    expect(vi.mocked(dependencies.retry).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(dependencies.execute).mock.invocationCallOrder[0]);
+  });
+  it("does not execute if setting claimed visibility fails", async () => {
+    const { dependencies, run } = setup();
+    vi.mocked(dependencies.retry).mockRejectedValueOnce(new Error("SQS unavailable"));
+    expect(await run({ Records: [record()] })).toEqual({ batchItemFailures: [{ itemIdentifier: "message-a" }] });
+    expect(dependencies.execute).not.toHaveBeenCalled();
+    expect(dependencies.fail).not.toHaveBeenCalled();
+  });
+
+  it("includes approved execution diagnostics without private exception text", async () => {
+    const { dependencies, run } = setup();
+    vi.mocked(dependencies.execute).mockRejectedValue(Object.assign(new Error("private SQL and token"), { code: "P2028" }));
+    await run({ Records: [record()] });
+    expect(dependencies.log).toHaveBeenCalledWith(expect.objectContaining({ outcome: "JOB_EXECUTION_FAILED", phase: "execute", errorCode: "P2028" }));
+    expect(JSON.stringify(vi.mocked(dependencies.log).mock.calls)).not.toMatch(/private SQL|token/);
   });
 
   it("records a continuation safety-limit breach as a terminal, visible DLQ outcome", async () => {

@@ -68,6 +68,76 @@ worker rollout, compatibility with older publication markers, and rollback.
 
 ## Status
 
-Implementation started on `a/jobs-reliable-recovery`. No runtime changes or new
-production verification have occurred yet. Update this section at completion
-with commits, tests, review state and rollout instructions.
+Implemented on `a/jobs-reliable-recovery`. The fix uses the existing generation
+job and material revision rows as durable publication intent. It adds no table,
+migration, service, queue, scheduler or provider. Production has not changed.
+
+## Recovery contract
+
+| Failure | What happens |
+| --- | --- |
+| Temporary refill provider, source or database failure | Persist a retry checkpoint and throw a typed error to the worker. Replay the same generation job, with at most three executions and no second daily allowance. |
+| Invalid content, failed semantic verification or authentication failure | Publish no exercises; preserve a terminal domain failure. |
+| Process exits after the domain commit but before queue publication | Maintenance finds the persisted intent and sends it. |
+| Queue accepts a send but its response is lost | Retry the stored envelope identity and payload. The durable delivery ledger and domain claims tolerate duplicates beyond SQS's deduplication window. |
+| Worker starts or finishes before the publisher hears back | Publisher completion/failure updates compare the lease and domain state. They cannot overwrite the worker. |
+| Two publishers overlap, or an old publisher wakes after its lease expires | Only the current compare-and-set lease can finish. Preserve unrelated diagnostic metadata. |
+| Five publication attempts fail | Leave a visible failed domain record and a safe diagnostic. Explicit user repair starts a new publication cycle. A genuinely accepted late refill delivery can still claim an unexecuted job. |
+| Worker is killed | Initial SQS visibility remains 3,600 seconds. After a durable claim, visibility becomes 720 seconds, beyond the 660-second ledger lease and 600-second Lambda limit. A stuck visibility request aborts after five seconds; no business work starts if it fails. |
+| Last refill execution is killed, or terminal delivery cannot be acknowledged | Finalize unfinished refill state before sending the dead letter. If finalization or DLQ publication fails, leave the message available for another bounded transport attempt. Preserve completed and semantic outcomes. |
+| Provider returns after cancellation, or an older attempt tries to publish | Abort signals and attempt-fenced stage/publication writes prevent late publication. |
+| Account deletion or material deletion is requested | Recovery skips canceled owners/materials. Refill publication locks the account in deletion's lock order and checks its independent tombstone before writing exercises. |
+
+Maintenance recovers up to 25 rows per family after a five-minute quiet period.
+Publication attempts are five minutes apart. It stops claiming rows when less
+than 45 seconds of delivery time remain. Refills keep 30 seconds for cleanup;
+database evidence reads use server-side statement cancellation. Logs carry only
+approved codes, HTTP status numbers, stage names and identifiers, never raw
+provider bodies, SQL, credentials or study text.
+
+## Verification evidence
+
+Failure-injection tests were first observed failing, then passed after the
+corresponding changes. The complete local database gate passed **617 tests in
+49 suites** against disposable PostgreSQL 18 with pgvector and all migrations.
+It covers all three refill families, successful replay, bounded exhaustion,
+lost acknowledgements, crashes, overlapping publishers, stale attempts,
+deletion, ownership, malformed intent and unchanged learner history.
+
+Local lint, TypeScript, Prisma validation/generation, the web production build
+and Lambda package build passed. The unit gate passed **1,407 tests in 154 suites**.
+Anonymous browser checks passed **15 tests** at desktop and mobile widths.
+Check remote CI and review findings on this branch's PR before merge; those
+results are attached to its exact commit and must not be inferred from local tests.
+Integration tests now disable locally inherited
+Meta fallback credentials so mocked provider failures cannot make live AI calls.
+
+## Rollout and rollback
+
+1. Merge only after the required PR checks and review findings are resolved.
+2. Build/deploy the merged worker to staging using
+   [the existing worker deployment procedure](aws-background-jobs.md#deploy),
+   with staging schedules disabled. Verify the deployed artifact hash and run
+   an isolated refill/import canary without introducing skills or recording
+   learner attempts. Exercise temporary failure/recovery in staging.
+3. Release the merged worker to production with its existing schedules enabled,
+   then deploy/verify the web release. Both artifacts are required: a web deploy
+   alone does not update Lambda. Worker-first deployment can read older refill
+   delivery markers, including ones without a publisher lease ID.
+4. Verify queue/DLQ depth, errors, maintenance publication counters and pending
+   domain rows. Refill execution exhaustion reaches the existing DLQ; publication
+   exhaustion is a visible domain failure and safe log, requiring explicit repair.
+
+No schema migration is required. Old material revisions without a durable
+publication marker are deliberately excluded from automatic recovery; explicit
+retry creates the new marker. The fix does not blindly replay historic dead
+letters. If rollback is necessary, retain publication metadata and delivery
+records, restore the previously verified worker/web artifacts, and inspect
+pending rows before repair. An older worker does not provide these new recovery
+guarantees, so rolling it back pauses automatic material publication recovery.
+
+This is verified failure handling, not a promise that every outage will heal
+without intervention. Provider authentication errors, persistent outages,
+rejected content and unavailable database infrastructure can still reach
+bounded failure. Production failure injection, failover and backup restoration
+were not performed as part of this PR.

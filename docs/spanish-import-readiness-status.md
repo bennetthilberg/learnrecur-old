@@ -640,3 +640,32 @@ The previous production code artifact is retained at
 `production/c156e3e5d60741c7cb122f464a1d5cab6bb090f987589a5507ee072e447f14c9.zip`
 in the existing artifact bucket. No configuration rotation or database
 migration was performed by this worker release.
+
+### Obsolete maintenance dead letters — 2026-09-28 UTC
+
+The four production dead letters were individually inspected after the owner
+asked about fixing them. All four were `learnrecur/agent-access.maintenance`
+deliveries. They requested runs at `2026-09-26T03:28:03Z`,
+`2026-09-26T20:18:03Z`, `2026-09-27T02:58:03Z`, and
+`2026-09-27T04:28:03Z`. Each exhausted three execution attempts and has a
+matching terminal delivery row with `JOB_RETRIES_EXHAUSTED` and the same
+payload hash as its SQS envelope. Each following five-minute maintenance run
+completed successfully.
+
+The current database check found no stale activation claims and no running or
+retryable maintenance deliveries. The three post-release maintenance runs at
+02:18, 02:23, and 02:28 UTC all completed on attempt one. Maintenance scans
+current state, so these old runs do not represent work that needs replaying.
+
+The complete envelopes, original attributes, delivery-state checks, and failure
+logs were archived under the ignored local directory
+`.migration-private/dead-letters-20260928/`. Only the four inspected message IDs
+were deleted; each body was compared with its archive again before deletion.
+All four deletions succeeded, and the queue then had zero visible, in-flight,
+or delayed messages. No job was replayed and no learner or delivery record was
+modified. The backlog alarm was still awaiting its next five-minute evaluation
+at the immediate follow-up check; it was not manually forced to OK.
+
+The historical worker logs contain the attempts and failure categories but omit
+the underlying exceptions. Clearing this obsolete backlog does not establish
+what caused those four failures or prove that the cause cannot recur.

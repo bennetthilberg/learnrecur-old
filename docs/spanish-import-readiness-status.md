@@ -669,3 +669,78 @@ at the immediate follow-up check; it was not manually forced to OK.
 The historical worker logs contain the attempts and failure categories but omit
 the underlying exceptions. Clearing this obsolete backlog does not establish
 what caused those four failures or prove that the cause cannot recur.
+
+### Failure-handling audit — 2026-09-28 UTC
+
+The owner clarified that readiness means handling ordinary failures and edge
+cases, rather than having enough connections or compute. The expected scale is
+25 monthly active learners, up to ten concurrent practice sessions, and roughly
+10–15 imported skills per learner per day. This audit reviewed the deployed
+application revision `e145aec`; it did not change application or AWS behavior.
+
+The failure-handling foundation is sound for small, monitored production use:
+
+- The SQS worker claims a durable delivery lease, checks completed duplicates,
+  and acknowledges execution only after durable completion. Exceptions retry
+  with exponential delays starting at 30 seconds and capped at 900 seconds.
+  Job families allow three to five executions. Terminal failures are persisted
+  before dead-letter publication, so a failed DLQ write cannot silently discard
+  the original message or rerun terminal business work.
+- FIFO groups serialize related work by skill, source, or user lane. Unrelated
+  groups can continue while one group retries. Domain records and conditional
+  claim-token writes provide protection beyond SQS deduplication; this is not an
+  exactly-once guarantee for every external side effect.
+- Activation has bounded source, history, generation, verification and database
+  stages. The five-minute maintenance sweep recovers expired activation claims
+  and eligible queued items, including missing continuation publication.
+  Committed refill events with pending delivery markers also have recovery.
+- Gemini generation and verification use the configured Muse fallback. Muse
+  retries one transient HTTP or transport failure within its request timeout.
+  Both providers remain subject to validation and verification. The earlier
+  September 25 live provider-handoff smoke exercised real Muse after a forced
+  Gemini 503; the current release did not repeat that provider-failure smoke.
+- Practice answer checking is deterministic. Stable attempt identities and
+  transactional writes make a save retry converge after a lost response. Browser
+  recovery keeps unfinished answers and supports retry after save confirmation
+  times out. Background generation cannot create reviews or advance FSRS.
+
+There are still recovery gaps worth closing before claiming that temporary
+failures consistently resolve without user or operator action:
+
+1. **Returned refill failures bypass queue retries.** In
+   `refillChoiceExercisesForSkill` and its exact-input/math counterparts,
+   generation or verification exceptions can become a persisted failed job and
+   a returned `not-refilled` result. Dispatch then resolves and the worker
+   acknowledges the delivery. Unexpected exceptions that escape do retry, but
+   a temporary provider outage returned this way ends this job's automatic retry
+   cycle. Later practice preparation or an explicit repair may create another
+   request. Add a typed transient outcome and bounded replay of the same job;
+   keep semantic rejection terminal and preserve quota/idempotency guards.
+2. **Publication recovery is incomplete.** A process exit before publishing a
+   committed pending refill is recovered, but a caught send failure can mark it
+   `FAILED` with `event-send-failed`, outside the pending-event recovery scan.
+   Material import publication similarly returns a failed state and retry
+   guidance. Keep temporary publication failures recoverable with bounded
+   delivery attempts, while retaining terminal outcomes for invalid requests.
+3. **Bounds and diagnostics are uneven.** Ordinary refills do not receive the
+   activation worker's delivery deadline for all source/database stages. A hard
+   Lambda stop can therefore wait for the 3,600-second SQS visibility timeout.
+   Handled execution failures also omit their underlying safe error codes from
+   worker logs; the four historical maintenance failures remain unexplained.
+   Extend stage bounds to refill reads and add privacy-safe failure diagnostics.
+
+The existing Essential-0 database has backups but no automatic high-availability
+failover, as recorded in `docs/heroku-postgres-migration.md`. Database service
+outages can interrupt practice; application retries cannot provide an alternate
+database. This audit did not refresh backup state or perform a new restore drill.
+
+At the live follow-up check around 02:42 UTC, all seven production CloudWatch
+alarms were `OK`, including the previously active dead-letter backlog alarm.
+The production main queue had zero visible, in-flight and delayed messages.
+Twelve focused unit files passed all 143 tests covering delivery failures,
+duplicate handling, leases, retries, deadlines, transport, dispatch, publication,
+infrastructure, activation recovery and AI fallback. A second focused run passed
+all 12 tests across review-save confirmation, practice recovery and PostgreSQL
+connection configuration. These runs overlap on practice recovery. No new live
+failure injection, database integration run or browser run was performed; the
+earlier release verification and current worker canary remain their evidence.

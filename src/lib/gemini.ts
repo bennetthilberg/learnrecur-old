@@ -302,7 +302,19 @@ export function getPublicGeminiScopePlanningFailureMessage(error: unknown): stri
 }
 
 export function getGeminiErrorLogDetails(error: unknown) {
-  return getGeminiErrorDetails(error);
+  const { code, status } = getGeminiErrorDetails(error);
+  // Provider exception text may echo source material. Policy decisions use
+  // the original details; logs expose only HTTP codes and known statuses.
+  return {
+    code: code !== null && Number.isInteger(code) && code >= 100 && code <= 599 ? code : null,
+    status: status && [
+      "CANCELLED", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND",
+      "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+      "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED",
+      "INTERNAL", "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED", "UNKNOWN",
+      "BAD_GATEWAY", "GATEWAY_TIMEOUT",
+    ].includes(status) ? status : null,
+  };
 }
 
 function getGeminiErrorDetails(error: unknown): GeminiErrorDetails {

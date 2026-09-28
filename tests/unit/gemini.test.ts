@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   GEMINI_LOW_THINKING_CONFIG,
+  getGeminiErrorLogDetails,
   getGeminiRuntimeLogContext,
   getPublicGeminiFailureMessage,
   getPublicGeminiScopePlanningFailureMessage,
@@ -12,6 +13,12 @@ import {
 } from "@/lib/gemini";
 
 describe("Gemini fallback helpers", () => {
+  it("keeps approved provider codes while excluding private exception text", () => {
+    const error = new Error(JSON.stringify({ error: { code: 503, status: "UNAVAILABLE", message: "private study text and provider body" } }));
+    expect(getGeminiErrorLogDetails(error)).toEqual({ code: 503, status: "UNAVAILABLE" });
+    expect(getGeminiErrorLogDetails(new Error("private source text"))).toEqual({ code: null, status: null });
+    expect(getGeminiErrorLogDetails({ code: 503, status: "private response text" })).toEqual({ code: 503, status: null });
+  });
   it("defaults the primary model to Gemini 3.8 Flash", () => {
     const config = resolveGeminiRuntimeConfig({
       GEMINI_API_KEY: "developer-key",

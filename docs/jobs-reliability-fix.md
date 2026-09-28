@@ -105,7 +105,7 @@ lost acknowledgements, crashes, overlapping publishers, stale attempts,
 deletion, ownership, malformed intent and unchanged learner history.
 
 Local lint, TypeScript, Prisma validation/generation, the web production build
-and Lambda package build passed. The unit gate passed **1,407 tests in 154 suites**.
+and Lambda package build passed. The unit gate passed **1,411 tests in 154 suites**.
 Anonymous browser checks passed **15 tests** at desktop and mobile widths.
 Check remote CI and review findings on this branch's PR before merge; those
 results are attached to its exact commit and must not be inferred from local tests.

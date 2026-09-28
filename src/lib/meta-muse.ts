@@ -1,4 +1,5 @@
 import { JobStageTimeoutError } from "@/lib/jobs/deadline";
+import { getSafeJobErrorDetails } from "@/lib/jobs/errors";
 
 export const DEFAULT_META_MUSE_BASE_URL = "https://api.meta.ai/v1";
 export const DEFAULT_META_MUSE_MODEL = "muse-spark-1.3";
@@ -329,7 +330,10 @@ function normalizedMetaMuseError(input: {
   status: string;
   message: string;
 }) {
-  return new Error(JSON.stringify({ error: input }));
+  return Object.assign(new Error(JSON.stringify({ error: input })), {
+    code: input.code,
+    status: input.status,
+  });
 }
 
 function readMetaMuseOutputText(value: unknown): string | null {
@@ -364,15 +368,7 @@ function summarizeUsage(value: unknown) {
 }
 
 function getMetaMuseErrorLogDetails(error: unknown) {
-  const record = parseJsonRecord(error instanceof Error ? error.message : null);
-  const nested = toRecord(record?.error) ?? record;
-  return {
-    code: readNumber(nested?.code),
-    status: readString(nested?.status),
-    message:
-      readString(nested?.message) ??
-      (error instanceof Error && error.message.trim() ? error.message : null),
-  };
+  return getSafeJobErrorDetails(error);
 }
 
 function parseMaybeJson(value: string): unknown {
@@ -383,17 +379,6 @@ function parseMaybeJson(value: string): unknown {
     return JSON.parse(value) as unknown;
   } catch {
     return value;
-  }
-}
-
-function parseJsonRecord(value: string | null): Record<string, unknown> | null {
-  if (!value) {
-    return null;
-  }
-  try {
-    return toRecord(JSON.parse(value) as unknown);
-  } catch {
-    return null;
   }
 }
 

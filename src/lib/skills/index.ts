@@ -4922,7 +4922,9 @@ export async function refillExactInputExercisesForSkill(
       retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
+      providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
       return refillJobNoLongerRunning(
@@ -5592,7 +5594,9 @@ export async function refillMathExercisesForSkill(
       retryable: retryMetadata.retryable,
       acceptedCount: 0,
       rejectedCount: 0,
-      now: input.now,
+      now: eventNow(),
+      attemptCount: generationJob.attemptCount,
+      providerUsage: providerUsage.latest(),
     });
     if (!jobFailed) {
       return refillJobNoLongerRunning(

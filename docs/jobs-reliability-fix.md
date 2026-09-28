@@ -80,6 +80,7 @@ migration, service, queue, scheduler or provider. Production has not changed.
 | Temporary refill provider, source or database failure | Persist a retry checkpoint and throw a typed error to the worker. Replay the same generation job, with at most three executions and no second daily allowance. |
 | Invalid content, failed semantic verification or authentication failure | Publish no exercises; preserve a terminal domain failure. |
 | Process exits after the domain commit but before queue publication | Maintenance finds the persisted intent and sends it. |
+| Database becomes unavailable during immediate publication after commit | The request remains accepted and pending. Maintenance retries the persisted intent when storage recovers, including acknowledgement/lease writes that could not finish. Recovery sweeps still throw infrastructure failures into the worker retry cycle. |
 | Queue accepts a send but its response is lost | Retry the stored envelope identity and payload. The durable delivery ledger and domain claims tolerate duplicates beyond SQS's deduplication window. |
 | Worker starts or finishes before the publisher hears back | Publisher completion/failure updates compare the lease and domain state. They cannot overwrite the worker. |
 | Two publishers overlap, or an old publisher wakes after its lease expires | Only the current compare-and-set lease can finish. Preserve unrelated diagnostic metadata. |
@@ -99,7 +100,7 @@ provider bodies, SQL, credentials or study text.
 ## Verification evidence
 
 Failure-injection tests were first observed failing, then passed after the
-corresponding changes. The complete local database gate passed **623 tests in
+corresponding changes. The complete local database gate passed **635 tests in
 49 suites** against disposable PostgreSQL 18 with pgvector and all migrations.
 It covers all three refill families, successful replay, bounded exhaustion,
 lost acknowledgements, crashes, overlapping publishers, stale attempts,
@@ -107,6 +108,11 @@ deletion, ownership, malformed intent and unchanged learner history.
 Agent import tests cover PDF/URL publication recovery, stable identity after a
 lost acknowledgement, and operation polling after bounded send exhaustion.
 Successful choice refill retries record their actual attempt and retry count.
+Additional regressions inject database failures at candidate reads, claims,
+pre-send checks, acknowledgements and retry persistence. They also hold an old
+source loader while a newer refill attempt claims the job, then reject the old
+load and verify that the new attempt remains untouched. All refill families use
+fresh completion timestamps for source failures.
 
 Local lint, TypeScript, Prisma validation/generation, the web production build
 and Lambda package build passed. The unit gate passed **1,411 tests in 154 suites**.

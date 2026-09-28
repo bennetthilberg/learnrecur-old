@@ -17,6 +17,11 @@ import {
 } from "@/lib/skills/refill-jobs";
 import { buildJobEnvelope } from "@/lib/jobs/contracts";
 import { recoverInterruptedJob } from "@/lib/jobs/recovery";
+import {
+  refillChoiceExercisesForSkill,
+  refillExactInputExercisesForSkill,
+  refillMathExercisesForSkill,
+} from "@/lib/skills";
 
 const describeDatabase =
   process.env.RUN_DATABASE_TESTS === "1" ? describe : describe.skip;
@@ -32,6 +37,7 @@ const families = [
     kind: "choice",
     queue: queueChoiceExerciseRefillForSkill,
     run: runChoiceExerciseRefillJob,
+    refill: refillChoiceExercisesForSkill,
     generator: "generateChoiceExercises",
     verifier: "verifyChoiceExercises",
     exercise: {
@@ -50,6 +56,7 @@ const families = [
     kind: "exact-input",
     queue: queueExactInputExerciseRefillForSkill,
     run: runExactInputExerciseRefillJob,
+    refill: refillExactInputExercisesForSkill,
     generator: "generateExactInputExercises",
     verifier: "verifyExactInputExercises",
     exercise: {
@@ -72,6 +79,7 @@ const families = [
     kind: "math",
     queue: queueMathExerciseRefillForSkill,
     run: runMathExerciseRefillJob,
+    refill: refillMathExercisesForSkill,
     generator: "generateMathExercises",
     verifier: "verifyMathExercises",
     exercise: {
@@ -119,6 +127,127 @@ describeDatabase("refill reliability", () => {
       sender,
     };
   }
+
+  async function attachMaterialSource(input: {
+    userId: string;
+    skillId: string;
+  }) {
+    const material = await prisma.studyMaterial.create({
+      data: { userId: input.userId, title: "Source fixture", kind: "WEB" },
+    });
+    const revision = await prisma.materialRevision.create({
+      data: {
+        userId: input.userId,
+        materialId: material.id,
+        revisionNumber: 1,
+        status: "READY",
+      },
+    });
+    const source = await prisma.sourceFile.create({
+      data: {
+        userId: input.userId,
+        materialRevisionId: revision.id,
+        kind: "URL",
+        status: "READY",
+        originalName: "Source fixture",
+      },
+    });
+    await prisma.skillSourceRef.create({
+      data: {
+        userId: input.userId,
+        skillId: input.skillId,
+        sourceFileId: source.id,
+      },
+    });
+  }
+
+  it.each(families)(
+    "keeps a late $kind source failure from failing a newer attempt",
+    async (family) => {
+      const input = await fixture(`late-source-${family.kind}`);
+      await attachMaterialSource(input);
+      const queued = await family.queue(input);
+      if (queued.status !== "queued") throw new Error(queued.message);
+      let started!: () => void;
+      let finish!: () => void;
+      const hasStarted = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const canFinish = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const old = family
+        .refill({
+          ...input,
+          generationJobId: queued.generationJobId,
+          [family.generator]: async () => ({ exercises: [] }),
+          [family.verifier]: async () => ({ verifications: [] }),
+          sourceEvidenceLoader: async () => {
+            started();
+            await canFinish;
+            throw Object.assign(new Error("synthetic old source outage"), {
+              code: 503,
+            });
+          },
+        })
+        .then(
+          (result) => ({ result }),
+          (error) => ({ error }),
+        );
+      await hasStarted;
+      const current = await prisma.generationJob.update({
+        where: { id: queued.generationJobId },
+        data: { attemptCount: 2, status: "RUNNING", checkpoint: "claimed" },
+      });
+      finish();
+      await old;
+      expect(
+        await prisma.generationJob.findUniqueOrThrow({
+          where: { id: current.id },
+        }),
+      ).toEqual(current);
+      expect(
+        await prisma.generationAuditRecord.count({
+          where: { jobId: current.id },
+        }),
+      ).toBe(0);
+    },
+  );
+
+  it.each(families)(
+    "uses completion time for a current $kind source failure",
+    async (family) => {
+      const input = await fixture(`source-clock-${family.kind}`);
+      await attachMaterialSource(input);
+      const queued = await family.queue(input);
+      if (queued.status !== "queued") throw new Error(queued.message);
+      const completedAt = new Date(input.now.getTime() + 30_000);
+      await expect(
+        family.refill({
+          ...input,
+          generationJobId: queued.generationJobId,
+          eventNow: () => completedAt,
+          [family.generator]: async () => ({ exercises: [] }),
+          [family.verifier]: async () => ({ verifications: [] }),
+          sourceEvidenceLoader: async () => {
+            throw Object.assign(new Error("synthetic current source outage"), {
+              code: 503,
+            });
+          },
+        }),
+      ).resolves.toMatchObject({ retryable: true });
+      expect(
+        await prisma.generationJob.findUniqueOrThrow({
+          where: { id: queued.generationJobId },
+        }),
+      ).toMatchObject({
+        status: "FAILED",
+        checkpoint: "retryable-exception",
+        attemptCount: 1,
+        completedAt,
+      });
+    },
+  );
 
   it.each(families)(
     "retries a temporary $kind provider outage on the same job without learner writes",

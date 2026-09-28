@@ -7,6 +7,7 @@ import {
   recoverMaterialIngestionPublications,
 } from "@/lib/materials/ingestion-publication";
 import type { MaterialIngestionEventSender } from "@/lib/jobs/events";
+import { JobContinuationLimitError } from "@/lib/jobs/publication-context";
 
 const describeDatabase =
   process.env.RUN_DATABASE_TESTS === "1" ? describe : describe.skip;
@@ -63,6 +64,90 @@ describeDatabase("durable material ingestion publication", () => {
   const sender = (
     run: MaterialIngestionEventSender["sendMaterialIngestionRequested"],
   ): MaterialIngestionEventSender => ({ sendMaterialIngestionRequested: run });
+
+  it.each([
+    { stage: "candidate", failures: [1], sendFails: false },
+    { stage: "claim", failures: [2], sendFails: false },
+    { stage: "pre-send", failures: [3], sendFails: false },
+    { stage: "acknowledgement", failures: [4, 5], sendFails: false },
+    { stage: "retry persistence", failures: [4], sendFails: true },
+  ])(
+    "keeps committed intent recoverable after a $stage database outage",
+    async ({ failures, sendFails }) => {
+      const input = await fixture();
+      const sends: Array<{ eventId?: string; requestedAt: string }> = [];
+      const original = prisma.$transaction.bind(prisma) as unknown as (
+        operation: unknown,
+        options?: unknown,
+      ) => Promise<unknown>;
+      const spy = vi.spyOn(prisma, "$transaction");
+      let calls = 0;
+      spy.mockImplementation((async (...args: unknown[]) => {
+        calls += 1;
+        if (failures.includes(calls))
+          throw Object.assign(new Error("synthetic private database outage"), {
+            code: "P2028",
+          });
+        return original(args[0], args[1]);
+      }) as typeof prisma.$transaction);
+      try {
+        await expect(
+          publishMaterialIngestion({
+            ...input,
+            sender: sender(async (payload, options) => {
+              sends.push({
+                eventId: options?.eventId,
+                requestedAt: payload.requestedAt,
+              });
+              if (sendFails) throw new Error("synthetic lost response");
+            }),
+          }),
+        ).resolves.toBe("pending");
+      } finally {
+        spy.mockRestore();
+      }
+      expect(
+        await prisma.materialRevision.findUniqueOrThrow({
+          where: { id: input.materialRevisionId },
+        }),
+      ).toMatchObject({ status: "QUEUED", errorCode: null });
+      await prisma.materialRevision.update({
+        where: { id: input.materialRevisionId },
+        data: { updatedAt: new Date(0) },
+      });
+      await recoverMaterialIngestionPublications({
+        now: new Date(now.getTime() + 600_000),
+        sender: sender(async (payload, options) => {
+          sends.push({
+            eventId: options?.eventId,
+            requestedAt: payload.requestedAt,
+          });
+        }),
+      });
+      expect(sends.length).toBeGreaterThanOrEqual(1);
+      for (const send of sends) expect(send).toEqual(sends[0]);
+      expect(
+        (
+          await prisma.materialRevision.findUniqueOrThrow({
+            where: { id: input.materialRevisionId },
+          })
+        ).processingMetadata,
+      ).toMatchObject({ ingestionDelivery: { status: "delivered" } });
+    },
+  );
+
+  it("preserves the continuation limit instead of disguising it as pending publication", async () => {
+    const input = await fixture();
+    const error = new JobContinuationLimitError("fanout");
+    await expect(
+      publishMaterialIngestion({
+        ...input,
+        sender: sender(async () => {
+          throw error;
+        }),
+      }),
+    ).rejects.toBe(error);
+  });
 
   it("recovers commit-before-send crashes with the stored identity and preserves context", async () => {
     const input = await fixture();

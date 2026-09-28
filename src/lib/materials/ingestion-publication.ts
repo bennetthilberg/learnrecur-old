@@ -73,23 +73,39 @@ export async function publishMaterialIngestion(input: {
   now: Date;
   sender?: MaterialIngestionEventSender;
 }): Promise<PublicationResult> {
-  const candidate = await withBoundedActivationRead((tx) =>
-    tx.materialRevision.findFirst({
-      where: { id: input.materialRevisionId, ...activeWhere(input.userId) },
-      select: {
-        id: true,
-        userId: true,
-        updatedAt: true,
-        processingMetadata: true,
-      },
-    }),
-  );
-  if (!candidate) return "superseded";
-  return deliver(
-    candidate,
-    input.now,
-    input.sender ?? awsMaterialIngestionEventSender,
-  );
+  try {
+    const candidate = await withBoundedActivationRead((tx) =>
+      tx.materialRevision.findFirst({
+        where: { id: input.materialRevisionId, ...activeWhere(input.userId) },
+        select: {
+          id: true,
+          userId: true,
+          updatedAt: true,
+          processingMetadata: true,
+        },
+      }),
+    );
+    if (!candidate) return "superseded";
+    return await deliver(
+      candidate,
+      input.now,
+      input.sender ?? awsMaterialIngestionEventSender,
+    );
+  } catch (error) {
+    if (error instanceof JobContinuationLimitError) throw error;
+    // Callers have committed the intent. A database outage cannot undo that
+    // acceptance, so maintenance owns recovery even if this publisher cannot
+    // store its result. Keep sweeps throwing so their worker retries the outage.
+    console.warn(
+      JSON.stringify({
+        component: "material-publication",
+        revisionId: input.materialRevisionId,
+        outcome: "publication-deferred",
+        ...getSafeJobErrorDetails(error),
+      }),
+    );
+    return "pending";
+  }
 }
 
 /** Publication intent is part of the domain commit; this sweep closes both send crash windows. */

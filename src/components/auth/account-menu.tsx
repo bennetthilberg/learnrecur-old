@@ -3,6 +3,7 @@
 import { UserButton, useUser } from "@clerk/nextjs";
 import { useCallback, useRef, useSyncExternalStore } from "react";
 
+import { clerkUserProfileAppearance } from "@/components/app/clerk-appearance";
 import { designTokens } from "@/lib/design-tokens";
 
 const subscribe = () => () => {};
@@ -47,6 +48,7 @@ export function AccountMenu() {
                 colorPrimary: designTokens.colorPrimary,
               },
             }}
+            userProfileProps={{ appearance: clerkUserProfileAppearance }}
           />
         ) : fallback}
         <button

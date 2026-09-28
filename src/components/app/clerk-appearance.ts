@@ -116,19 +116,20 @@ export const clerkAppearance = {
       boxShadow: `0 3px 0 ${designTokens.colorButtonWhiteEdge}`,
     },
   },
-  // Keep the profile sidebar within the card radius and avoid applying the
-  // text-field height to its sign-out checkbox.
-  userProfile: {
-    elements: {
-      cardBox: {
-        overflow: "hidden",
-      },
-      formFieldInput__signOutOfOtherSessions: {
-        height: "18px",
-        minHeight: "18px",
-        padding: "0",
-        width: "18px",
-      },
+} as const;
+
+// These overrides belong to the UserProfile opened from UserButton. Clerk
+// only applies them when they are passed through UserButton.userProfileProps.
+export const clerkUserProfileAppearance = {
+  elements: {
+    cardBox: {
+      overflow: "hidden",
+    },
+    formFieldInput__signOutOfOtherSessions: {
+      height: "18px",
+      minHeight: "18px",
+      padding: "0",
+      width: "18px",
     },
   },
 } as const;

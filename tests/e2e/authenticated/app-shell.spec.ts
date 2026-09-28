@@ -49,6 +49,20 @@ for (const viewport of [
       path: testInfo.outputPath(`account-menu-${viewport.name}.png`),
       animations: "disabled",
     });
+
+    await page.getByRole("button", { name: /manage account/i }).click();
+    await page.getByRole("button", { name: "Security", exact: true }).click();
+    await page.getByRole("button", { name: "Update password", exact: true }).click();
+    const signOutCheckbox = page.locator("#signOutOfOtherSessions-field");
+    await expect(signOutCheckbox).toBeVisible();
+    await expect(signOutCheckbox).toHaveCSS("width", "18px");
+    await expect(signOutCheckbox).toHaveCSS("height", "18px");
+    const passwordFormCard = page.locator(".cl-cardBox").filter({ has: signOutCheckbox }).last();
+    await expect(passwordFormCard).toHaveCSS("overflow", "hidden");
+    await page.screenshot({
+      path: testInfo.outputPath(`account-security-${viewport.name}.png`),
+      animations: "disabled",
+    });
     expect(hydrationErrors).toEqual([]);
   });
 }

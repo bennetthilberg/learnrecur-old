@@ -554,3 +554,193 @@ exercise audit remain unverified. Automatic retries still depend on the
 30-to-120-second item backoff and the five-minute maintenance cadence when no
 other continuation arrives. This branch does not promise a shorter live retry
 than those bounds.
+
+## Activation worker release — 2026-09-28 UTC
+
+PR #169 merged as `e145aeca1492cc0374a91a8ae25c59391c607f43`. Vercel
+production deployment `dpl_BZcncBaurgthRKS494TyZMVQahNp` is Ready at that
+commit. The served production health endpoint and authenticated dependency
+probe passed in
+[run 36368828579](https://github.com/bennetthilberg/learnrecur/actions/runs/36368828579).
+
+The AWS worker was rebuilt from that merged tree and deployed to both
+`learnrecur-staging-jobs-worker` and `learnrecur-production-jobs-worker` in
+account `168992393637`, region `us-east-1`. Both Lambda `CodeSha256` values
+match the built ZIP:
+
+- SHA-256: `acb2a0b025a508a78f85b36d352add9af607c47098d6c03c9efdd09118f5d5bf`.
+- Lambda `CodeSha256`: `rLKgsCWlCKePhbNtNSrdmvYHxHCY1sA8nv3QkRj11b8=`.
+- Staging Lambda modified: `2026-09-28T02:07:47Z`.
+- Production Lambda modified: `2026-09-28T02:15:32Z`.
+
+Both CloudFormation stacks are `UPDATE_COMPLETE`; both functions are Active
+with successful updates. Existing encrypted configuration revisions were
+reused. Production schedules remain enabled, staging schedules disabled;
+the enabled SQS mappings retain batch size one and concurrency caps five
+and two, respectively. Reserved concurrency remains disabled and the Lambda
+timeout remains 600 seconds. Staging and production database names were
+confirmed distinct before creating fixtures.
+
+A disposable staging fixture submitted one source-backed Spanish possessive
+number-agreement spec through `createAgentSpecOperation`, then used the real
+SQS/Lambda/provider/database path. This was a worker canary, not a browser or
+OAuth test. Operation `cmukm5qi60008g6pvitclaxw2` succeeded at
+`2026-09-28T02:14:08.535Z`, 25.6 seconds after submission, with one active skill
+and five accepted, verified multiple-choice exercises. The answers and
+explanations were audited against the synthetic one-page PDF; its saved skill
+locator names exactly page one and the selected evidence chunk. Stage logs
+reported source evidence 119 ms, recent history 57 ms, generation 7,354 ms,
+and verification 16,024 ms. Item claims were cleared and the activation job
+completed after its creation time.
+
+The first fixture used an S3 key outside the worker's allowed `source-uploads/`
+prefix. It failed source loading in 128 ms, recorded a failed generation job,
+and released the item claim. Finalized source revisions correctly prevented
+editing that fixture, so it was removed and recreated with the permitted key.
+This was a fixture error, not a permissions change or a production retry.
+
+The successful canary's automatic exact-input follow-up ended in a `SEMANTIC`
+failure: zero of one required exercises passed verification. It published no
+additional exercises. The five activation exercises remain the quality evidence;
+exact-input refill quality is not established by this release. Both disposable
+fixture accounts and their S3 objects were removed after deliveries settled.
+Before removal, introduction timestamps were null, repetitions were zero,
+and no practice attempts or review logs existed. No production learner data
+was submitted, retried, introduced, or reviewed by the release checks.
+
+At the initial post-release queue check, both main queues and both scheduler
+dead-letter queues were empty. Staging's jobs dead-letter queue was empty.
+Production's jobs dead-letter queue held the same four messages seen before
+deployment; its existing backlog alarm remains active. Those messages were
+not received, redriven, or deleted. The other production alarms and all
+staging alarms were OK. This short canary verifies the deployed activation
+path; it does not establish performance under load or reproduce a live timeout.
+
+Production's first scheduled maintenance delivery after the update completed
+at `2026-09-28T02:18:18.816Z` on attempt one in 1,058 ms. It recorded zero
+activation recovery changes and zero publication failures. At `02:19:02Z`,
+the main queue still had zero visible, in-flight, and delayed messages;
+the jobs dead-letter count was still four. The checked live logs contained no
+new delivery failure after this deployment.
+
+For an idempotent redeploy from the exact release checkout:
+
+```sh
+npm run prisma:generate
+npm run jobs:build
+NODE_OPTIONS=--conditions=react-server npx tsx scripts/deploy-aws-jobs.ts \
+  --environment production \
+  --configuration-revision bb2607c5-bfa1-43f8-a8a6-878a70d2e02e \
+  --source-bucket learnrecur-prod-source-uploads \
+  --database-host c852t52v66nhup.cluster-czrs8kj4isg7.us-east-1.rds.amazonaws.com \
+  --schedules enabled
+```
+
+The previous production code artifact is retained at
+`production/c156e3e5d60741c7cb122f464a1d5cab6bb090f987589a5507ee072e447f14c9.zip`
+in the existing artifact bucket. No configuration rotation or database
+migration was performed by this worker release.
+
+### Obsolete maintenance dead letters — 2026-09-28 UTC
+
+The four production dead letters were individually inspected after the owner
+asked about fixing them. All four were `learnrecur/agent-access.maintenance`
+deliveries. They requested runs at `2026-09-26T03:28:03Z`,
+`2026-09-26T20:18:03Z`, `2026-09-27T02:58:03Z`, and
+`2026-09-27T04:28:03Z`. Each exhausted three execution attempts and has a
+matching terminal delivery row with `JOB_RETRIES_EXHAUSTED` and the same
+payload hash as its SQS envelope. Each following five-minute maintenance run
+completed successfully.
+
+The current database check found no stale activation claims and no running or
+retryable maintenance deliveries. The three post-release maintenance runs at
+02:18, 02:23, and 02:28 UTC all completed on attempt one. Maintenance scans
+current state, so these old runs do not represent work that needs replaying.
+
+The complete envelopes, original attributes, delivery-state checks, and failure
+logs were archived under the ignored local directory
+`.migration-private/dead-letters-20260928/`. Only the four inspected message IDs
+were deleted; each body was compared with its archive again before deletion.
+All four deletions succeeded, and the queue then had zero visible, in-flight,
+or delayed messages. No job was replayed and no learner or delivery record was
+modified. The backlog alarm was still awaiting its next five-minute evaluation
+at the immediate follow-up check; it was not manually forced to OK.
+
+The historical worker logs contain the attempts and failure categories but omit
+the underlying exceptions. Clearing this obsolete backlog does not establish
+what caused those four failures or prove that the cause cannot recur.
+
+### Failure-handling audit — 2026-09-28 UTC
+
+The owner clarified that readiness means handling ordinary failures and edge
+cases, rather than having enough connections or compute. The expected scale is
+25 monthly active learners, up to ten concurrent practice sessions, and roughly
+10–15 imported skills per learner per day. This audit reviewed the deployed
+application revision `e145aec`; it did not change application or AWS behavior.
+
+The failure-handling foundation is sound for small, monitored production use:
+
+- The SQS worker claims a durable delivery lease, checks completed duplicates,
+  and acknowledges execution only after durable completion. Exceptions retry
+  with exponential delays starting at 30 seconds and capped at 900 seconds.
+  Job families allow three to five executions. Terminal failures are persisted
+  before dead-letter publication, so a failed DLQ write cannot silently discard
+  the original message or rerun terminal business work.
+- FIFO groups serialize related work by skill, source, or user lane. Unrelated
+  groups can continue while one group retries. Domain records and conditional
+  claim-token writes provide protection beyond SQS deduplication; this is not an
+  exactly-once guarantee for every external side effect.
+- Activation has bounded source, history, generation, verification and database
+  stages. The five-minute maintenance sweep recovers expired activation claims
+  and eligible queued items, including missing continuation publication.
+  Committed refill events with pending delivery markers also have recovery.
+- Gemini generation and verification use the configured Muse fallback. Muse
+  retries one transient HTTP or transport failure within its request timeout.
+  Both providers remain subject to validation and verification. The earlier
+  September 25 live provider-handoff smoke exercised real Muse after a forced
+  Gemini 503; the current release did not repeat that provider-failure smoke.
+- Practice answer checking is deterministic. Stable attempt identities and
+  transactional writes make a save retry converge after a lost response. Browser
+  recovery keeps unfinished answers and supports retry after save confirmation
+  times out. Background generation cannot create reviews or advance FSRS.
+
+There are still recovery gaps worth closing before claiming that temporary
+failures consistently resolve without user or operator action:
+
+1. **Returned refill failures bypass queue retries.** In
+   `refillChoiceExercisesForSkill` and its exact-input/math counterparts,
+   generation or verification exceptions can become a persisted failed job and
+   a returned `not-refilled` result. Dispatch then resolves and the worker
+   acknowledges the delivery. Unexpected exceptions that escape do retry, but
+   a temporary provider outage returned this way ends this job's automatic retry
+   cycle. Later practice preparation or an explicit repair may create another
+   request. Add a typed transient outcome and bounded replay of the same job;
+   keep semantic rejection terminal and preserve quota/idempotency guards.
+2. **Publication recovery is incomplete.** A process exit before publishing a
+   committed pending refill is recovered, but a caught send failure can mark it
+   `FAILED` with `event-send-failed`, outside the pending-event recovery scan.
+   Material import publication similarly returns a failed state and retry
+   guidance. Keep temporary publication failures recoverable with bounded
+   delivery attempts, while retaining terminal outcomes for invalid requests.
+3. **Bounds and diagnostics are uneven.** Ordinary refills do not receive the
+   activation worker's delivery deadline for all source/database stages. A hard
+   Lambda stop can therefore wait for the 3,600-second SQS visibility timeout.
+   Handled execution failures also omit their underlying safe error codes from
+   worker logs; the four historical maintenance failures remain unexplained.
+   Extend stage bounds to refill reads and add privacy-safe failure diagnostics.
+
+The existing Essential-0 database has backups but no automatic high-availability
+failover, as recorded in `docs/heroku-postgres-migration.md`. Database service
+outages can interrupt practice; application retries cannot provide an alternate
+database. This audit did not refresh backup state or perform a new restore drill.
+
+At the live follow-up check around 02:42 UTC, all seven production CloudWatch
+alarms were `OK`, including the previously active dead-letter backlog alarm.
+The production main queue had zero visible, in-flight and delayed messages.
+Twelve focused unit files passed all 143 tests covering delivery failures,
+duplicate handling, leases, retries, deadlines, transport, dispatch, publication,
+infrastructure, activation recovery and AI fallback. A second focused run passed
+all 12 tests across review-save confirmation, practice recovery and PostgreSQL
+connection configuration. These runs overlap on practice recovery. No new live
+failure injection, database integration run or browser run was performed; the
+earlier release verification and current worker canary remain their evidence.
